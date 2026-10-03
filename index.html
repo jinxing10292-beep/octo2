@@ -104,7 +104,7 @@
                 </div>
                 <span class="count-badge" id="transformer-state">모델 없음</span>
               </div>
-              <p class="panel-description">모델 어휘에 등록된 단어 전체형을 우선 토큰으로 사용하고, 없는 단어는 등록된 어미를 기준으로 어간과 어미 토큰으로 나눕니다. 일부 받침 결합형도 처리하며, 어휘에 없는 조각은 문자 토큰으로 폴백합니다. 이는 규칙 기반 분리로 완전한 한국어 형태소 분석은 아닙니다. 문자·단어·어미 토큰을 함께 저장하는 디코더 트랜스포머이며, 5개 층·4개 헤드·차원 256·피드포워드 256·문맥 512토큰·혼합 어휘 최대 5,096개 설정으로 다음 토큰 예측을 훈련합니다. 매개변수는 최대 약 471만 개입니다. CPU에서 작동하므로 긴 문맥 훈련은 매우 느릴 수 있고, 브라우저 메모리도 크게 사용할 수 있습니다. JSON 가중치 파일은 수십 MB가 될 수 있습니다. 일반적인 0.6B 모델이 아니며 학습 자료에 없던 지식을 스스로 알게 되지는 않습니다.</p>
+              <p class="panel-description">모델 어휘에 등록된 단어는 단어 전체 토큰으로 사용합니다. 모르는 단어도 글자 조각으로 나누지 않고 남은 어휘 공간에 전체 단어로 추가하며, 기존 5,096개 한도에 도달하면 추가하지 못한 단어 수를 알립니다. 모델을 불러오면 기존 가중치를 보존하면서 기본 어휘를 최대 4,072토큰까지 보충하고, 학습 중 새 단어를 위한 공간을 최대 1,024토큰 남깁니다. 새 토큰은 가능한 기존 문자 가중치의 평균으로 초기화하며, 없던 문자는 무작위 초기화합니다. 따라서 새 토큰 자체는 학습되지 않은 값이며 관련 예문으로 훈련해야 합니다. 어미도 별도 토큰으로 보관하지만 단어를 자동 형태소 분해하지 않습니다. 모델은 5개 층·4개 헤드·차원 256·피드포워드 256·문맥 512토큰이며 최대 약 471만 매개변수입니다. CPU에서 긴 문맥을 훈련하면 매우 느릴 수 있고 브라우저 메모리도 크게 사용할 수 있습니다.</p>
               <div class="transformer-specs" aria-label="미니 모델 설정">
                 <span>5개 층</span><span>4개 어텐션 헤드</span><span>차원 256</span><span>피드포워드 256</span><span>문맥 512토큰</span><span>혼합 토큰 최대 5,096</span><span>최대 약 471만 매개변수</span><span>자바스크립트 CPU</span>
               </div>
@@ -145,8 +145,8 @@
                   </div>
                 </div>
                 <label class="sr-only" for="transformer-weights">모델 가중치 JSON</label>
-                <textarea id="transformer-weights" class="weights-json" rows="5" maxlength="134217728" spellcheck="false" placeholder="최대 128MB의 JSON 가중치를 붙여넣거나 파일을 선택하세요."></textarea>
-                <p class="form-help" id="weights-save-status">훈련 후 가중치는 이 브라우저의 IndexedDB에 자동 저장됩니다. 가중치 파일은 최대 128MB까지 지원합니다.</p>
+                <textarea id="transformer-weights" class="weights-json" rows="5" maxlength="268435456" spellcheck="false" placeholder="최대 256 MiB의 JSON 가중치를 붙여넣거나 파일을 선택하세요."></textarea>
+                <p class="form-help" id="weights-save-status">훈련 후 가중치는 이 브라우저의 IndexedDB에 자동 저장됩니다. 가중치 파일은 최대 256 MiB까지 지원합니다.</p>
                 <p class="form-help">브라우저는 GitHub Pages에 배포된 원본 파일을 직접 덮어쓸 수 없습니다. 파일 연결 기능은 사용자가 선택한 로컬 파일만 수정하며, GitHub 저장소에는 직접 커밋·업로드해야 합니다. SHA-256 체크섬은 전자서명이 아니므로 출처가 신뢰되는 파일만 사용하세요.</p>
               </div>
             </section>

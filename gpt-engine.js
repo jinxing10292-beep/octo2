@@ -12,11 +12,6 @@
   const MAX_VOCABULARY_SIZE = 5096;
   const MAX_CHARACTER_TOKENS = 1536;
   const WORD_PATTERN = /[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu;
-  const HANGUL_FINAL_CONSONANTS = [
-    null, "ㄱ", "ㄲ", "ㄳ", "ㄴ", "ㄵ", "ㄶ", "ㄷ", "ㄹ", "ㄺ", "ㄻ", "ㄼ",
-    "ㄽ", "ㄾ", "ㄿ", "ㅀ", "ㅁ", "ㅂ", "ㅄ", "ㅅ", "ㅆ", "ㅇ", "ㅈ", "ㅊ",
-    "ㅋ", "ㅌ", "ㅍ", "ㅎ",
-  ];
   const validatedModels = new WeakSet();
 
   function zeros(length) {
@@ -136,6 +131,72 @@
         languageHeadBias: zeros(vocabulary.length),
       },
     };
+  }
+
+  function expandVocabulary(model, additionalTokens) {
+    if (!validatedModels.has(model)) validateModel(model);
+    if (!Array.isArray(additionalTokens) || additionalTokens.some(token => typeof token !== "string" || !token)) {
+      throw new Error("추가 어휘는 비어 있지 않은 문자열 목록이어야 합니다.");
+    }
+
+    const tokenSet = new Set(model.vocabulary);
+    const tokensToAdd = [];
+    for (const token of additionalTokens) {
+      if (tokenSet.has(token)) continue;
+      tokenSet.add(token);
+      tokensToAdd.push(token);
+      if (model.vocabulary.length + tokensToAdd.length === MAX_VOCABULARY_SIZE) break;
+    }
+    const capacity = MAX_VOCABULARY_SIZE - model.vocabulary.length;
+    tokensToAdd.length = Math.min(tokensToAdd.length, capacity);
+    if (!tokensToAdd.length) return 0;
+
+    const oldSize = model.vocabulary.length;
+    const newSize = oldSize + tokensToAdd.length;
+    const expandedTokenMap = new Map(model.vocabulary.map((token, index) => [token, index]));
+    const initializationScale = Math.sqrt(2 / (newSize + MODEL_DIMENSION));
+    for (let index = 0; index < tokensToAdd.length; index += 1) {
+      const token = tokensToAdd[index];
+      const characterIds = [...token]
+        .map(character => expandedTokenMap.get(character))
+        .filter(id => id !== undefined);
+      const embedding = Array.from(
+        { length: MODEL_DIMENSION },
+        () => (Math.random() * 2 - 1) * initializationScale,
+      );
+      const output = Array.from(
+        { length: MODEL_DIMENSION },
+        () => (Math.random() * 2 - 1) * initializationScale,
+      );
+      let bias = 0;
+      if (characterIds.length) {
+        for (let dimension = 0; dimension < MODEL_DIMENSION; dimension += 1) {
+          embedding[dimension] = characterIds.reduce(
+            (sum, id) => sum + model.weights.tokenEmbedding[id][dimension],
+            0,
+          ) / characterIds.length;
+          output[dimension] = characterIds.reduce(
+            (sum, id) => sum + model.weights.languageHead[dimension][id],
+            0,
+          ) / characterIds.length;
+        }
+        bias = characterIds.reduce((sum, id) => sum + model.weights.languageHeadBias[id], 0) / characterIds.length;
+      }
+      model.weights.tokenEmbedding.push(embedding);
+      model.weights.languageHead.forEach((row, dimension) => row.push(output[dimension]));
+      model.weights.languageHeadBias.push(bias);
+      model.vocabulary.push(token);
+      expandedTokenMap.set(token, oldSize + index);
+    }
+
+    if (model.vocabulary.length !== newSize ||
+        model.weights.tokenEmbedding.length !== newSize ||
+        model.weights.languageHead.some(row => row.length !== newSize) ||
+        model.weights.languageHeadBias.length !== newSize) {
+      throw new Error("어휘 확장 중 모델 가중치 크기가 일치하지 않습니다.");
+    }
+    validateModel(model);
+    return tokensToAdd.length;
   }
 
   function validateMatrix(value, rows, columns, name) {
@@ -464,28 +525,6 @@
     return loss / targets.length;
   }
 
-  function matchEnding(stem, candidate) {
-    if (stem.endsWith(candidate) && stem.length > candidate.length) {
-      return { stem: stem.slice(0, -candidate.length), ending: candidate };
-    }
-    const [initial, ...tailParts] = candidate;
-    const tail = tailParts.join("");
-    if (!HANGUL_FINAL_CONSONANTS.includes(initial)) return null;
-    const prefix = tail ? stem.slice(0, -tail.length) : stem;
-    const prefixCharacters = [...prefix];
-    const syllable = prefixCharacters[prefixCharacters.length - 1];
-    if (!syllable) return null;
-    const codePoint = syllable.codePointAt(0);
-    const syllableIndex = codePoint - 0xac00;
-    if (syllableIndex < 0 || syllableIndex >= 11172) return null;
-    const finalIndex = syllableIndex % 28;
-    if (!finalIndex || HANGUL_FINAL_CONSONANTS[finalIndex] !== initial) return null;
-    const openSyllable = String.fromCodePoint(codePoint - finalIndex);
-    const nextStem = `${prefix.slice(0, -syllable.length)}${openSyllable}`;
-    if (!nextStem) return null;
-    return { stem: nextStem, ending: candidate };
-  }
-
   function tokenizeText(model, text) {
     if (typeof text !== "string") throw new Error("토큰화할 문장은 문자열이어야 합니다.");
     const tokenMap = new Map(model.vocabulary.map((token, index) => [token, index]));
@@ -493,11 +532,13 @@
     const tokens = [];
     let currentSegment = [];
     let unknownCharacters = 0;
+    let unknownWords = 0;
 
-    const appendToken = token => {
+    const appendToken = (token, isWord = false) => {
       const id = tokenMap.get(token);
       if (id === undefined) {
         unknownCharacters += [...token].length;
+        if (isWord) unknownWords += 1;
         if (currentSegment.length) segments.push(currentSegment);
         currentSegment = [];
       } else {
@@ -505,30 +546,7 @@
         tokens.push(token);
       }
     };
-    const appendWord = word => {
-      if (tokenMap.has(word)) {
-        appendToken(word);
-        return;
-      }
-      let stem = word;
-      const suffixes = [];
-      while (stem) {
-        let endingMatch = null;
-        for (const candidate of model.endings) {
-          const match = tokenMap.has(candidate) ? matchEnding(stem, candidate) : null;
-          if (match && (!endingMatch || [...candidate].length > [...endingMatch.ending].length)) {
-            endingMatch = match;
-          }
-        }
-        if (!endingMatch) break;
-        suffixes.push(endingMatch.ending);
-        stem = endingMatch.stem;
-        if (tokenMap.has(stem)) break;
-      }
-      const stemTokens = tokenMap.has(stem) ? [stem] : [...stem];
-      const pieces = [...stemTokens, ...suffixes.reverse()];
-      for (const piece of pieces) appendToken(piece);
-    };
+    const appendWord = word => appendToken(word, true);
 
     let lastIndex = 0;
     for (const match of text.matchAll(WORD_PATTERN)) {
@@ -538,7 +556,17 @@
     }
     for (const character of text.slice(lastIndex)) appendToken(character);
     if (currentSegment.length) segments.push(currentSegment);
-    return { segments, tokens, unknownCharacters };
+    return { segments, tokens, unknownCharacters, unknownWords };
+  }
+
+  function addTextWords(model, text) {
+    if (!validatedModels.has(model)) validateModel(model);
+    if (typeof text !== "string") throw new Error("훈련 문장은 문자열이어야 합니다.");
+    const words = [...new Set([...text.matchAll(WORD_PATTERN)].map(match => match[0]))];
+    const added = expandVocabulary(model, words);
+    const vocabulary = new Set(model.vocabulary);
+    const missing = words.filter(word => !vocabulary.has(word));
+    return { added, missing };
   }
 
   function trainStep(model, corpus, contextLength = CONTEXT_LENGTH) {
@@ -595,6 +623,8 @@
       heads: ATTENTION_HEADS,
     }),
     createModel,
+    expandVocabulary,
+    addTextWords,
     validateModel,
     trainStep,
     generate,

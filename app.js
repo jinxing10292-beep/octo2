@@ -7,7 +7,10 @@ const MODEL_STORE = "checkpoints";
 const MODEL_STORAGE_KEY = "latest-ko-word-ending-char-5l-4h-256d-512c-5096v";
 const TRAINING_CHECKPOINT_INTERVAL = 25;
 const WEIGHTS_PACKAGE_FORMAT = "octo-mini-weights-package-v3";
-const MAX_WEIGHTS_FILE_BYTES = 128 * 1024 * 1024;
+const MAX_WEIGHTS_FILE_BYTES = 256 * 1024 * 1024;
+const MAX_MODEL_VOCABULARY_SIZE = 5096;
+const RESERVED_TRAINING_WORD_TOKENS = 1024;
+const DEFAULT_VOCABULARY_TARGET = MAX_MODEL_VOCABULARY_SIZE - RESERVED_TRAINING_WORD_TOKENS;
 
 const BUILT_IN_DOCUMENTS = [
   {
@@ -20,7 +23,7 @@ const BUILT_IN_DOCUMENTS = [
     id: "training-status",
     title: "모델 및 훈련 상태",
     url: "#training",
-    text: "훈련실은 단어 전체형, 등록된 어미, 문자 폴백을 사용하는 한국어 디코더 트랜스포머를 CPU에서 다음 토큰 예측으로 훈련합니다. 모델은 5개 층, 4개 어텐션 헤드, 차원 256, 피드포워드 256, 문맥 512토큰, 최대 어휘 5,096개이며 약 471만 매개변수로 일반적인 대화형 언어 모델이나 0.6B 모델보다 작습니다.",
+    text: "훈련실은 단어 전체형을 토큰으로 사용하는 한국어 디코더 트랜스포머를 CPU에서 다음 토큰 예측으로 훈련합니다. 모르는 단어도 문자 조각으로 나누지 않고 남은 어휘 공간에 단어 전체를 추가합니다. 모델은 5개 층, 4개 어텐션 헤드, 차원 256, 피드포워드 256, 문맥 512토큰, 최대 어휘 5,096개이며 약 471만 매개변수로 일반적인 대화형 언어 모델이나 0.6B 모델보다 작습니다.",
   },
   {
     id: "data-and-sources",
@@ -421,12 +424,45 @@ document.querySelector("#import-file").addEventListener("change", async event =>
 
 function setTransformerModel(model, status = "모델 준비됨") {
   transformerModel = window.OCTO_MINI_GPT.validateModel(model);
+  const existingTokens = new Set(transformerModel.vocabulary);
+  const missingSeedTokens = [...new Set(collectVocabularySeedTokens(transformerModel))]
+    .filter(token => !existingTokens.has(token))
+    .slice(0, Math.max(0, DEFAULT_VOCABULARY_TARGET - transformerModel.vocabulary.length));
+  const addedTokens = window.OCTO_MINI_GPT.expandVocabulary(
+    transformerModel,
+    missingSeedTokens,
+  );
   const parameterCount = countParameters(transformerModel.weights);
   document.querySelector("#transformer-state").textContent =
-    `${status} · 토큰 ${transformerModel.vocabulary.length}종 · ${parameterCount.toLocaleString("ko-KR")}개 매개변수`;
+    `${status} · 토큰 ${transformerModel.vocabulary.length}종 · ${parameterCount.toLocaleString("ko-KR")}개 매개변수` +
+    (addedTokens ? ` · 기본 토큰 ${addedTokens}종 보충(기존 문자 가중치로 초기화, 신규 문자는 무작위, 추가 학습 필요)` : "");
   document.querySelector("#generate-transformer-sample").disabled = false;
   document.querySelector("#export-transformer-weights").disabled = false;
   document.querySelector("#copy-transformer-weights").disabled = false;
+  return addedTokens;
+}
+
+function collectVocabularySeedTokens(model) {
+  const vocabulary = window.OCTO_KO_VOCABULARY;
+  const wordTokens = [];
+  const seenWords = new Set();
+  for (const [category, definition] of Object.entries(vocabulary)) {
+    if (category === "endings") continue;
+    const sources = [definition.daily || "", definition.items || "", definition.additional || "", definition.more || ""];
+    if (definition.groups) sources.push(...Object.values(definition.groups));
+    for (const source of sources) {
+      for (let word of source.trim().split(/\s+/u)) {
+        if (category === "verbs" || category === "adjectives") word = word.replace(/-$/u, "");
+        if (word && !seenWords.has(word)) {
+          seenWords.add(word);
+          wordTokens.push(word);
+        }
+      }
+    }
+  }
+  const characterTokens = [...new Set([...wordTokens.join(""), ..." \n\t.,!?;:()[]{}\"'"])];
+  const endings = model.endings || [];
+  return [...characterTokens, ...endings, ...wordTokens];
 }
 
 function countParameters(value) {
@@ -499,7 +535,7 @@ async function saveTrainingCheckpoint(writeConnectedFile = false) {
     const packageData = await makeWeightsPackage();
     const packageJSON = JSON.stringify(packageData);
     if (new TextEncoder().encode(packageJSON).byteLength > MAX_WEIGHTS_FILE_BYTES) {
-      throw new Error("가중치 패키지가 128MB 제한을 넘어 자동 저장하지 못했습니다.");
+      throw new Error("가중치 패키지가 256 MiB 제한을 넘어 자동 저장하지 못했습니다.");
     }
     await writeModelCheckpoint(packageJSON);
     if (writeConnectedFile && weightsFileHandle) {
@@ -534,9 +570,14 @@ async function initializeSavedTransformer() {
     const savedPackage = await readModelCheckpoint();
     if (savedPackage) {
       const model = await readWeightsPackage(savedPackage);
-      setTransformerModel(model, "자동 저장 모델");
-      status.textContent = "이 브라우저에 저장된 가중치를 불러왔습니다. 이어서 훈련할 수 있습니다.";
-      setWeightsSaveStatus("이 브라우저에 저장된 체크포인트를 불러왔습니다. 이어서 훈련하면 기존 가중치가 갱신됩니다.");
+      const addedTokens = setTransformerModel(model, "자동 저장 모델");
+      if (addedTokens) await saveTrainingCheckpoint(false);
+      status.textContent = addedTokens
+        ? `${addedTokens}개 기본 토큰을 보충했습니다. 기존 학습값은 보존했으며 새 토큰은 기존 문자 가중치로 초기화하고, 없는 문자는 무작위 초기화해 추가 학습이 필요합니다.`
+        : "이 브라우저에 저장된 가중치를 불러왔습니다. 이어서 훈련할 수 있습니다.";
+      if (!addedTokens) {
+        setWeightsSaveStatus("이 브라우저에 저장된 체크포인트를 불러왔습니다. 이어서 훈련하면 기존 가중치가 갱신됩니다.");
+      }
       setTransformerTrainingControls(false);
       return;
     }
@@ -550,13 +591,20 @@ async function initializeSavedTransformer() {
     if (!response.ok) throw new Error(`weights.json을 읽지 못했습니다 (HTTP ${response.status}).`);
     const contentLength = Number(response.headers.get("content-length"));
     if (Number.isFinite(contentLength) && contentLength > MAX_WEIGHTS_FILE_BYTES) {
-      throw new Error("배포된 weights.json이 128MB 제한을 넘었습니다.");
+      throw new Error("배포된 weights.json이 256 MiB 제한을 넘었습니다.");
     }
     const json = await response.text();
     const model = await readWeightsPackage(json);
-    setTransformerModel(model, "weights.json 불러옴");
-    status.textContent = "배포된 weights.json을 불러왔습니다. 훈련을 시작하면 기존 가중치에서 이어 학습합니다.";
-    setWeightsSaveStatus("배포된 weights.json을 불러왔습니다. 훈련 체크포인트는 이 브라우저에 자동 저장됩니다.");
+    const addedTokens = setTransformerModel(model, "weights.json 불러옴");
+    const checkpointSaved = addedTokens ? await saveTrainingCheckpoint(false) : false;
+    status.textContent = addedTokens
+      ? `${addedTokens}개 기본 토큰을 보충했습니다. 기존 학습값은 보존했으며 새 토큰은 기존 문자 가중치로 초기화하고, 없는 문자는 무작위 초기화해 관련 문장으로 학습해야 합니다.`
+      : "배포된 weights.json을 불러왔습니다. 훈련을 시작하면 기존 가중치에서 이어 학습합니다.";
+    if (!addedTokens) {
+      setWeightsSaveStatus("배포된 weights.json을 불러왔습니다. 훈련 체크포인트는 이 브라우저에 자동 저장됩니다.");
+    } else if (checkpointSaved) {
+      setWeightsSaveStatus("기존 학습 가중치를 보존하고 기본 어휘를 추가한 체크포인트를 저장했습니다. 새 토큰은 아직 학습되지 않았으므로 훈련 후 가중치 JSON을 내려받으세요.");
+    }
   } catch (error) {
     console.error("Could not load bundled weights.json.", error);
     status.textContent = "기존 가중치를 불러오지 못했습니다. JSON 파일을 선택하거나 무작위 모델을 초기화하세요.";
@@ -601,6 +649,8 @@ document.querySelector("#start-transformer-training").addEventListener("click", 
   let corpus;
   let steps;
   let vocabularyCoverage = 0;
+  let addedTrainingWords = 0;
+  let omittedTrainingWords = 0;
   try {
     corpus = readTrainingCorpus();
     steps = Number.parseInt(document.querySelector("#training-steps").value, 10);
@@ -613,6 +663,10 @@ document.querySelector("#start-transformer-training").addEventListener("click", 
     } else {
       window.OCTO_MINI_GPT.validateModel(transformerModel);
     }
+    const wordExpansion = window.OCTO_MINI_GPT.addTextWords(transformerModel, corpus);
+    addedTrainingWords = wordExpansion.added;
+    omittedTrainingWords = wordExpansion.missing.length;
+    if (addedTrainingWords) setTransformerModel(transformerModel, "학습 단어 추가");
     const tokenization = window.OCTO_MINI_GPT.tokenize(transformerModel, corpus);
     const corpusCharacters = [...corpus];
     const knownCharacterCount = corpusCharacters.length - tokenization.unknownCharacters;
@@ -620,6 +674,9 @@ document.querySelector("#start-transformer-training").addEventListener("click", 
       throw new Error("현재 모델 어휘에서 이어지는 훈련 토큰을 찾지 못했습니다. 새 단어나 문자를 추가하거나 현재 문장으로 모델을 초기화하세요.");
     }
     vocabularyCoverage = Math.round((knownCharacterCount / corpusCharacters.length) * 100);
+    if (omittedTrainingWords) {
+      showToast(`어휘 상한에 도달해 새로운 단어 ${omittedTrainingWords}개를 통째로 추가하지 못했습니다. 기존 단어는 글자로 쪼개지지 않습니다.`);
+    }
   } catch (error) {
     console.error("Could not start mini-transformer training.", error);
     showToast(error.message || "훈련을 시작하지 못했습니다.");
@@ -629,7 +686,9 @@ document.querySelector("#start-transformer-training").addEventListener("click", 
   cancelTransformerTraining = false;
   setTransformerTrainingControls(true);
   document.querySelector("#training-progress-fill").style.width = "0%";
-  document.querySelector("#training-status").textContent = "다음 토큰 예측으로 가중치를 갱신하는 중...";
+  document.querySelector("#training-status").textContent =
+    `다음 토큰 예측으로 가중치를 갱신하는 중...${addedTrainingWords ? ` 새 단어 ${addedTrainingWords}개 추가` : ""}` +
+    (omittedTrainingWords ? ` · 어휘 초과 단어 ${omittedTrainingWords}개 제외` : "");
   document.querySelector("#training-loss").textContent = "";
   const losses = [];
   let step = 0;
@@ -651,7 +710,10 @@ document.querySelector("#start-transformer-training").addEventListener("click", 
       const start = Math.max(0, losses.length - 25);
       const recentLoss = losses.slice(start).reduce((sum, loss) => sum + loss, 0) / (losses.length - start);
       document.querySelector("#training-progress-fill").style.width = `${(step / steps) * 100}%`;
-      document.querySelector("#training-status").textContent = `훈련 중 · ${step}/${steps}단계 · 어휘 적용률 ${vocabularyCoverage}%`;
+      document.querySelector("#training-status").textContent =
+        `훈련 중 · ${step}/${steps}단계 · 어휘 적용률 ${vocabularyCoverage}%` +
+        (addedTrainingWords ? ` · 새 단어 ${addedTrainingWords}개` : "") +
+        (omittedTrainingWords ? ` · 한도 초과 ${omittedTrainingWords}개` : "");
       document.querySelector("#training-loss").textContent = `최근 손실 ${recentLoss.toFixed(3)}`;
       if (step < steps) {
         window.setTimeout(runStep, 0);
@@ -712,11 +774,11 @@ async function makeWeightsPackage() {
 
 async function readWeightsPackage(json) {
   if (typeof json !== "string" || json.length > MAX_WEIGHTS_FILE_BYTES) {
-    throw new Error("가중치 JSON이 128MB 제한을 넘었습니다.");
+    throw new Error("가중치 JSON이 256 MiB 제한을 넘었습니다.");
   }
   const byteLength = new TextEncoder().encode(json).byteLength;
   if (byteLength > MAX_WEIGHTS_FILE_BYTES) {
-    throw new Error("가중치 파일이 128MB 제한을 넘었습니다.");
+    throw new Error("가중치 파일이 256 MiB 제한을 넘었습니다.");
   }
   const parsed = JSON.parse(json);
   const packageKeys = Object.keys(parsed || {}).sort();
@@ -750,7 +812,7 @@ document.querySelector("#export-transformer-weights").addEventListener("click", 
     const packageData = await makeWeightsPackage();
     const json = JSON.stringify(packageData, null, 2);
     if (new TextEncoder().encode(json).byteLength > MAX_WEIGHTS_FILE_BYTES) {
-      throw new Error("가중치 패키지가 128MB 제한을 넘었습니다.");
+      throw new Error("가중치 패키지가 256 MiB 제한을 넘었습니다.");
     }
     document.querySelector("#transformer-weights").value = json;
     const blob = new Blob([json], { type: "application/json" });
@@ -772,7 +834,7 @@ document.querySelector("#copy-transformer-weights").addEventListener("click", as
     const packageData = await makeWeightsPackage();
     const json = JSON.stringify(packageData, null, 2);
     if (new TextEncoder().encode(json).byteLength > MAX_WEIGHTS_FILE_BYTES) {
-      throw new Error("가중치 패키지가 128MB 제한을 넘었습니다.");
+      throw new Error("가중치 패키지가 256 MiB 제한을 넘었습니다.");
     }
     document.querySelector("#transformer-weights").value = json;
     if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
@@ -799,11 +861,15 @@ document.querySelector("#import-transformer-weights").addEventListener("click", 
 
 async function importTransformerWeights(json) {
   const imported = await readWeightsPackage(json);
-  setTransformerModel(imported, "JSON 불러옴");
-  document.querySelector("#training-status").textContent = "가중치를 불러왔습니다. 같은 어휘에 포함된 문장으로 이어서 훈련하거나 출력을 생성할 수 있습니다.";
+  const addedTokens = setTransformerModel(imported, "JSON 불러옴");
+  document.querySelector("#training-status").textContent = addedTokens
+    ? `${addedTokens}개 기본 토큰을 보충했습니다. 기존 학습값은 보존했으며 새 토큰은 가능한 기존 문자 가중치로 초기화하고, 없는 문자는 무작위 초기화했으므로 관련 문장으로 학습한 뒤 내보내세요.`
+    : "가중치를 불러왔습니다. 같은 어휘에 포함된 문장으로 이어서 훈련하거나 출력을 생성할 수 있습니다.";
   await saveTrainingCheckpoint(false);
   document.querySelector("#generation-output").textContent = "가중치를 불러왔습니다. 시작 문구를 입력하고 생성을 눌러 보세요.";
-  showToast("SHA-256 및 모델 구조 검증을 통과한 가중치를 불러왔습니다.");
+  showToast(addedTokens
+  ? `검증된 가중치를 보존하고 기본 토큰 ${addedTokens}개를 보충했습니다. 새 토큰을 훈련하고 가중치를 다시 내려받으세요.`
+    : "SHA-256 및 모델 구조 검증을 통과한 가중치를 불러왔습니다.");
 }
 
 document.querySelector("#connect-weights-file").addEventListener("click", async () => {
@@ -818,15 +884,19 @@ document.querySelector("#connect-weights-file").addEventListener("click", async 
     const permission = await handle.requestPermission({ mode: "readwrite" });
     if (permission !== "granted") throw new Error("선택한 파일에 대한 쓰기 권한이 허용되지 않았습니다.");
     const file = await handle.getFile();
-    if (file.size > MAX_WEIGHTS_FILE_BYTES) throw new Error("가중치 파일이 128MB 제한을 넘었습니다.");
+    if (file.size > MAX_WEIGHTS_FILE_BYTES) throw new Error("가중치 파일이 256 MiB 제한을 넘었습니다.");
     const json = await file.text();
     const imported = await readWeightsPackage(json);
     weightsFileHandle = handle;
-    setTransformerModel(imported, "weights.json 연결됨");
-    document.querySelector("#training-status").textContent = "선택한 weights.json의 가중치를 불러왔습니다. 다음 훈련은 이 가중치에서 이어집니다.";
+    const addedTokens = setTransformerModel(imported, "weights.json 연결됨");
+    document.querySelector("#training-status").textContent = addedTokens
+      ? `${addedTokens}개 기본 토큰을 보충했습니다. 기존 학습값은 유지되고 새 토큰은 기존 문자 가중치(없는 문자는 무작위 값)로 초기화되므로 관련 문장으로 훈련해야 합니다.`
+      : "선택한 weights.json의 가중치를 불러왔습니다. 다음 훈련은 이 가중치에서 이어집니다.";
     const checkpointSaved = await saveTrainingCheckpoint(false);
     if (checkpointSaved) {
-      setWeightsSaveStatus("브라우저 체크포인트를 갱신했고, 선택한 로컬 weights.json에도 훈련 완료 시 결과를 기록합니다.");
+      setWeightsSaveStatus(addedTokens
+        ? "확장된 가중치를 브라우저 체크포인트에 저장했습니다. 선택한 weights.json 파일은 훈련 완료 전까지 바뀌지 않습니다."
+        : "브라우저 체크포인트를 갱신했고, 선택한 로컬 weights.json에도 훈련 완료 시 결과를 기록합니다.");
     }
     showToast("가중치 파일을 검증하고 연결했습니다.");
   } catch (error) {
@@ -845,7 +915,7 @@ document.querySelector("#transformer-weights-file").addEventListener("change", a
   if (!file) return;
   try {
     if (file.size > MAX_WEIGHTS_FILE_BYTES) {
-      throw new Error("가중치 파일이 128MB 제한을 넘었습니다.");
+      throw new Error("가중치 파일이 256 MiB 제한을 넘었습니다.");
     }
     const json = await file.text();
     document.querySelector("#transformer-weights").value = json;
