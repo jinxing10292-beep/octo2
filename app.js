@@ -14,7 +14,7 @@ const BUILT_IN_DOCUMENTS = [
     id: "training-status",
     title: "모델 및 훈련 상태",
     url: "#training",
-    text: "훈련실은 무작위 초기화한 소형 문자 단위 디코더 트랜스포머를 CPU에서 다음 문자 예측으로 실제 훈련하고 가중치를 JSON으로 내보낼 수 있습니다. 이 미니 모델은 1개 층, 1개 어텐션 헤드, 은닉 차원 16, 문맥 32자 구조이며 일반적인 대화형 언어 모델이나 0.6B 모델이 아닙니다. 0.6B 모델의 훈련·추론에 필요한 자원은 별도로 마련해야 합니다. 훈련 데이터와 모델 가중치는 자동으로 저장되지 않으며 사용자가 내보내 보관해야 합니다.",
+    text: "훈련실은 무작위 초기화한 소형 문자 단위 디코더 트랜스포머를 CPU에서 다음 문자 예측으로 실제 훈련하고 가중치를 JSON으로 내보낼 수 있습니다. 이 미니 모델은 3개 층, 2개 어텐션 헤드, 차원 64, 문맥 216자, 문자 어휘 최대 1,024개 구조이며 일반적인 대화형 언어 모델이나 0.6B 모델이 아닙니다. 0.6B 모델의 훈련·추론에 필요한 자원은 별도로 마련해야 합니다. 훈련 데이터와 모델 가중치는 자동으로 저장되지 않으며 사용자가 내보내 보관해야 합니다.",
   },
   {
     id: "data-and-sources",
@@ -35,8 +35,9 @@ const datasetEmpty = document.querySelector("#dataset-empty");
 const toast = document.querySelector("#toast");
 let toastTimer;
 let transformerModel = null;
-let transformerTraining = false;
 let cancelTransformerTraining = false;
+const WEIGHTS_PACKAGE_FORMAT = "octo-mini-weights-package-v1";
+const MAX_WEIGHTS_FILE_BYTES = 20 * 1024 * 1024;
 
 function readStoredArray(key) {
   try {
@@ -415,15 +416,23 @@ document.querySelector("#import-file").addEventListener("change", async event =>
 
 function setTransformerModel(model, status = "모델 준비됨") {
   transformerModel = window.OCTO_MINI_GPT.validateModel(model);
+  const parameterCount = countParameters(transformerModel.weights);
   document.querySelector("#transformer-state").textContent =
-    `${status} · 문자 ${transformerModel.vocabulary.length}종`;
+    `${status} · 문자 ${transformerModel.vocabulary.length}종 · ${parameterCount.toLocaleString("ko-KR")}개 매개변수`;
   document.querySelector("#generate-transformer-sample").disabled = false;
   document.querySelector("#export-transformer-weights").disabled = false;
   document.querySelector("#copy-transformer-weights").disabled = false;
 }
 
+function countParameters(value) {
+  if (Array.isArray(value)) return value.reduce((sum, child) => sum + countParameters(child), 0);
+  if (value && typeof value === "object") {
+    return Object.values(value).reduce((sum, child) => sum + countParameters(child), 0);
+  }
+  return 1;
+}
+
 function setTransformerTrainingControls(isRunning) {
-  transformerTraining = isRunning;
   document.querySelector("#start-transformer-training").disabled = isRunning;
   document.querySelector("#initialize-transformer").disabled = isRunning;
   document.querySelector("#use-examples-as-corpus").disabled = isRunning;
@@ -486,7 +495,7 @@ document.querySelector("#start-transformer-training").addEventListener("click", 
       modelVocabulary.has(character) && modelVocabulary.has(corpusCharacters[index + 1]),
     );
     if (!hasTrainablePair) {
-      throw new Error("현재 모델 어휘와 겹치는 문자가 없습니다. 현재 문장으로 모델을 초기화하세요.");
+      throw new Error("현재 모델 어휘에서 연속된 훈련 문자를 찾지 못했습니다. 문장에 문자를 추가하거나 현재 문장으로 모델을 초기화하세요.");
     }
     vocabularyCoverage = Math.round((knownCharacterCount / corpusCharacters.length) * 100);
   } catch (error) {
@@ -557,14 +566,64 @@ document.querySelector("#generate-transformer-sample").addEventListener("click",
   }
 });
 
-function transformerWeightsJSON() {
+async function makeWeightsPackage() {
   if (!transformerModel) throw new Error("먼저 모델을 초기화하거나 훈련하세요.");
-  return JSON.stringify(transformerModel);
+  window.OCTO_MINI_GPT.validateModel(transformerModel);
+  if (!crypto.subtle || typeof crypto.subtle.digest !== "function") {
+    throw new Error("SHA-256 무결성 검사를 지원하는 보안 연결(HTTPS)에서 다시 시도하세요.");
+  }
+  const modelJSON = JSON.stringify(transformerModel);
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(modelJSON));
+  const checksum = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+  return {
+    format: WEIGHTS_PACKAGE_FORMAT,
+    checksum: { algorithm: "SHA-256", value: checksum },
+    model: transformerModel,
+  };
 }
 
-document.querySelector("#export-transformer-weights").addEventListener("click", () => {
+async function readWeightsPackage(json) {
+  if (typeof json !== "string" || json.length > MAX_WEIGHTS_FILE_BYTES) {
+    throw new Error("가중치 JSON이 20MB 제한을 넘었습니다.");
+  }
+  const byteLength = new TextEncoder().encode(json).byteLength;
+  if (byteLength > MAX_WEIGHTS_FILE_BYTES) {
+    throw new Error("가중치 파일이 20MB 제한을 넘었습니다.");
+  }
+  const parsed = JSON.parse(json);
+  const packageKeys = Object.keys(parsed || {}).sort();
+  if (packageKeys.join(",") !== "checksum,format,model") {
+    throw new Error("가중치 패키지에 알 수 없거나 누락된 항목이 있습니다.");
+  }
+  if (!parsed || parsed.format !== WEIGHTS_PACKAGE_FORMAT ||
+      !parsed.checksum || parsed.checksum.algorithm !== "SHA-256" ||
+      typeof parsed.checksum.value !== "string" || !/^[a-f0-9]{64}$/u.test(parsed.checksum.value)) {
+    throw new Error("지원하지 않는 가중치 파일입니다. Octo 가중치 패키지를 사용하세요.");
+  }
+  const checksumKeys = Object.keys(parsed.checksum).sort();
+  if (checksumKeys.join(",") !== "algorithm,value") {
+    throw new Error("체크섬 정보에 알 수 없거나 누락된 항목이 있습니다.");
+  }
+  if (!crypto.subtle || typeof crypto.subtle.digest !== "function") {
+    throw new Error("SHA-256 무결성 검사를 지원하는 보안 연결(HTTPS)에서 다시 시도하세요.");
+  }
+  const model = window.OCTO_MINI_GPT.validateModel(parsed.model);
+  const modelJSON = JSON.stringify(model);
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(modelJSON));
+  const actualChecksum = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
+  if (actualChecksum !== parsed.checksum.value) {
+    throw new Error("가중치 SHA-256 검증에 실패했습니다. 파일이 손상되었거나 변경되었을 수 있습니다.");
+  }
+  return model;
+}
+
+document.querySelector("#export-transformer-weights").addEventListener("click", async () => {
   try {
-    const json = JSON.stringify(transformerModel, null, 2);
+    const packageData = await makeWeightsPackage();
+    const json = JSON.stringify(packageData, null, 2);
+    if (new TextEncoder().encode(json).byteLength > MAX_WEIGHTS_FILE_BYTES) {
+      throw new Error("가중치 패키지가 20MB 제한을 넘었습니다.");
+    }
     document.querySelector("#transformer-weights").value = json;
     const blob = new Blob([json], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -573,7 +632,7 @@ document.querySelector("#export-transformer-weights").addEventListener("click", 
     link.download = "octo-mini-decoder-weights.json";
     link.click();
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-    showToast("미니 트랜스포머 가중치를 JSON 파일로 내보냈습니다.");
+    showToast("SHA-256 검증값을 포함한 가중치 JSON을 다운로드했습니다.");
   } catch (error) {
     console.error("Could not export mini-transformer weights.", error);
     showToast(error.message || "가중치 내보내기에 실패했습니다.");
@@ -582,8 +641,12 @@ document.querySelector("#export-transformer-weights").addEventListener("click", 
 
 document.querySelector("#copy-transformer-weights").addEventListener("click", async () => {
   try {
-    const json = transformerWeightsJSON();
-    document.querySelector("#transformer-weights").value = JSON.stringify(transformerModel, null, 2);
+    const packageData = await makeWeightsPackage();
+    const json = JSON.stringify(packageData, null, 2);
+    if (new TextEncoder().encode(json).byteLength > MAX_WEIGHTS_FILE_BYTES) {
+      throw new Error("가중치 패키지가 20MB 제한을 넘었습니다.");
+    }
+    document.querySelector("#transformer-weights").value = json;
     if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
       document.querySelector("#transformer-weights").focus();
       document.querySelector("#transformer-weights").select();
@@ -597,16 +660,42 @@ document.querySelector("#copy-transformer-weights").addEventListener("click", as
   }
 });
 
-document.querySelector("#import-transformer-weights").addEventListener("click", () => {
+document.querySelector("#import-transformer-weights").addEventListener("click", async () => {
   try {
-    const imported = JSON.parse(document.querySelector("#transformer-weights").value);
-    setTransformerModel(imported, "JSON 불러옴");
-    document.querySelector("#training-status").textContent = "가중치를 불러왔습니다. 같은 어휘에 포함된 문장으로 이어서 훈련하거나 출력을 생성할 수 있습니다.";
-    document.querySelector("#generation-output").textContent = "가중치를 불러왔습니다. 시작 문구를 입력하고 생성을 눌러 보세요.";
-    showToast("가중치 JSON을 검증하고 불러왔습니다.");
+    await importTransformerWeights(document.querySelector("#transformer-weights").value);
   } catch (error) {
     console.error("Could not import mini-transformer weights.", error);
     showToast(error.message || "가중치 JSON을 불러오지 못했습니다.");
+  }
+});
+
+async function importTransformerWeights(json) {
+  const imported = await readWeightsPackage(json);
+  setTransformerModel(imported, "JSON 불러옴");
+  document.querySelector("#training-status").textContent = "가중치를 불러왔습니다. 같은 어휘에 포함된 문장으로 이어서 훈련하거나 출력을 생성할 수 있습니다.";
+  document.querySelector("#generation-output").textContent = "가중치를 불러왔습니다. 시작 문구를 입력하고 생성을 눌러 보세요.";
+  showToast("SHA-256 및 모델 구조 검증을 통과한 가중치를 불러왔습니다.");
+}
+
+document.querySelector("#select-transformer-weights").addEventListener("click", () => {
+  document.querySelector("#transformer-weights-file").click();
+});
+
+document.querySelector("#transformer-weights-file").addEventListener("change", async event => {
+  const [file] = event.target.files || [];
+  if (!file) return;
+  try {
+    if (file.size > MAX_WEIGHTS_FILE_BYTES) {
+      throw new Error("가중치 파일이 20MB 제한을 넘었습니다.");
+    }
+    const json = await file.text();
+    document.querySelector("#transformer-weights").value = json;
+    await importTransformerWeights(json);
+  } catch (error) {
+    console.error("Could not load mini-transformer weights file.", error);
+    showToast(error.message || "가중치 파일을 불러오지 못했습니다.");
+  } finally {
+    event.target.value = "";
   }
 });
 

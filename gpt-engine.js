@@ -1,11 +1,15 @@
 (function () {
   "use strict";
 
-  const FORMAT = "octo-mini-decoder-v1";
-  const MODEL_DIMENSION = 16;
-  const FEED_FORWARD_DIMENSION = 32;
-  const CONTEXT_LENGTH = 32;
-  const MAX_VOCABULARY_SIZE = 256;
+  const FORMAT = "octo-mini-decoder-v2";
+  const MODEL_DIMENSION = 64;
+  const ATTENTION_HEADS = 2;
+  const HEAD_DIMENSION = MODEL_DIMENSION / ATTENTION_HEADS;
+  const FEED_FORWARD_DIMENSION = MODEL_DIMENSION * 2;
+  const TRANSFORMER_LAYERS = 3;
+  const CONTEXT_LENGTH = 216;
+  const MAX_VOCABULARY_SIZE = 1024;
+  const validatedModels = new WeakSet();
 
   function zeros(length) {
     return Array.from({ length }, () => 0);
@@ -29,10 +33,6 @@
     return result;
   }
 
-  function addInto(target, source) {
-    for (let index = 0; index < target.length; index += 1) target[index] += source[index];
-  }
-
   function addOuter(gradient, left, right) {
     for (let row = 0; row < left.length; row += 1) {
       for (let column = 0; column < right.length; column += 1) {
@@ -53,6 +53,7 @@
     for (const character of characters) {
       frequencies.set(character, (frequencies.get(character) || 0) + 1);
     }
+
     const priorityCharacters = [" ", "\n", "\t", ":", "?", "!", ".", ","];
     const vocabulary = priorityCharacters.filter(character => frequencies.has(character));
     const remaining = [...frequencies.entries()]
@@ -75,139 +76,199 @@
         hidden,
         context: CONTEXT_LENGTH,
         maxVocabulary: MAX_VOCABULARY_SIZE,
-        layers: 1,
-        heads: 1,
+        layers: TRANSFORMER_LAYERS,
+        heads: ATTENTION_HEADS,
         objective: "next-character-prediction",
       },
       weights: {
         tokenEmbedding: matrix(vocabulary.length, dimension, true),
         positionEmbedding: matrix(CONTEXT_LENGTH, dimension, true),
-        query: matrix(dimension, dimension, true),
-        key: matrix(dimension, dimension, true),
-        value: matrix(dimension, dimension, true),
-        attentionOutput: matrix(dimension, dimension, true),
-        feedForwardIn: matrix(dimension, hidden, true),
-        feedForwardInBias: zeros(hidden),
-        feedForwardOut: matrix(hidden, dimension, true),
-        feedForwardOutBias: zeros(dimension),
+        layers: Array.from({ length: TRANSFORMER_LAYERS }, () => ({
+          query: matrix(dimension, dimension, true),
+          key: matrix(dimension, dimension, true),
+          value: matrix(dimension, dimension, true),
+          attentionOutput: matrix(dimension, dimension, true),
+          feedForwardIn: matrix(dimension, hidden, true),
+          feedForwardInBias: zeros(hidden),
+          feedForwardOut: matrix(hidden, dimension, true),
+          feedForwardOutBias: zeros(dimension),
+        })),
         languageHead: matrix(dimension, vocabulary.length, true),
         languageHeadBias: zeros(vocabulary.length),
       },
     };
   }
 
+  function validateMatrix(value, rows, columns, name) {
+    if (!Array.isArray(value) || value.length !== rows ||
+        value.some(row => !Array.isArray(row) || row.length !== columns ||
+          row.some(number => !Number.isFinite(number)))) {
+      throw new Error(`모델 가중치의 크기나 값이 올바르지 않습니다: ${name}`);
+    }
+  }
+
+  function validateVector(value, length, name) {
+    if (!Array.isArray(value) || value.length !== length || value.some(number => !Number.isFinite(number))) {
+      throw new Error(`모델 편향값의 크기나 값이 올바르지 않습니다: ${name}`);
+    }
+  }
+
+  function validateExactKeys(value, expectedKeys, name) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error(`${name} 구조가 올바르지 않습니다.`);
+    }
+    const actualKeys = Object.keys(value).sort();
+    const expected = [...expectedKeys].sort();
+    if (actualKeys.length !== expected.length || actualKeys.some((key, index) => key !== expected[index])) {
+      throw new Error(`${name}에 알 수 없거나 누락된 항목이 있습니다.`);
+    }
+  }
+
   function validateModel(model) {
     if (!model || model.format !== FORMAT || model.language !== "ko") {
-      throw new Error("지원하지 않는 모델 형식입니다.");
+      throw new Error("지원하지 않는 가중치 형식입니다. 3층 모델 가중치 JSON인지 확인하세요.");
     }
-    if (!Array.isArray(model.vocabulary) || model.vocabulary.length < 2 || model.vocabulary.some(token => typeof token !== "string" || [...token].length !== 1)) {
-      throw new Error("모델의 문자 어휘가 올바르지 않습니다.");
+    validateExactKeys(model, ["format", "language", "tokenizer", "vocabulary", "config", "weights"], "모델");
+    if (!Array.isArray(model.vocabulary) || model.vocabulary.length < 2 ||
+        model.vocabulary.length > MAX_VOCABULARY_SIZE ||
+        model.vocabulary.some(token => typeof token !== "string" || [...token].length !== 1)) {
+      throw new Error(`모델 어휘는 한 글자 토큰 ${MAX_VOCABULARY_SIZE}개 이하여야 합니다.`);
     }
-    if (new Set(model.vocabulary).size !== model.vocabulary.length) throw new Error("모델 어휘에 중복 토큰이 있습니다.");
+    if (new Set(model.vocabulary).size !== model.vocabulary.length) {
+      throw new Error("모델 어휘에 중복 토큰이 있습니다.");
+    }
+
     const config = model.config;
     const weights = model.weights;
     const d = MODEL_DIMENSION;
     const h = FEED_FORWARD_DIMENSION;
     const v = model.vocabulary.length;
-    if (!config || config.dimension !== d || config.hidden !== h || config.context !== CONTEXT_LENGTH || config.maxVocabulary !== MAX_VOCABULARY_SIZE || config.layers !== 1 || config.heads !== 1) {
-      throw new Error("지원하지 않는 모델 구조입니다.");
+    validateExactKeys(
+      config,
+      ["dimension", "hidden", "context", "maxVocabulary", "layers", "heads", "objective"],
+      "모델 설정",
+    );
+    if (config.dimension !== d || config.hidden !== h ||
+        config.context !== CONTEXT_LENGTH || config.maxVocabulary !== MAX_VOCABULARY_SIZE ||
+        config.layers !== TRANSFORMER_LAYERS || config.heads !== ATTENTION_HEADS ||
+        config.objective !== "next-character-prediction" || model.tokenizer !== "unicode-character") {
+      throw new Error("가중치의 모델 설정이 현재 3층·2헤드 구조와 일치하지 않습니다.");
+    }
+    validateExactKeys(weights, ["tokenEmbedding", "positionEmbedding", "layers", "languageHead", "languageHeadBias"], "모델 가중치");
+
+    validateMatrix(weights.tokenEmbedding, v, d, "tokenEmbedding");
+    validateMatrix(weights.positionEmbedding, CONTEXT_LENGTH, d, "positionEmbedding");
+    validateMatrix(weights.languageHead, d, v, "languageHead");
+    validateVector(weights.languageHeadBias, v, "languageHeadBias");
+    if (!Array.isArray(weights.layers) || weights.layers.length !== TRANSFORMER_LAYERS) {
+      throw new Error(`모델에는 트랜스포머 층이 정확히 ${TRANSFORMER_LAYERS}개 있어야 합니다.`);
     }
 
-    const matrixShapes = {
-      tokenEmbedding: [v, d],
-      positionEmbedding: [CONTEXT_LENGTH, d],
-      query: [d, d],
-      key: [d, d],
-      value: [d, d],
-      attentionOutput: [d, d],
-      feedForwardIn: [d, h],
-      feedForwardOut: [h, d],
-      languageHead: [d, v],
-    };
-    for (const [name, shape] of Object.entries(matrixShapes)) {
-      const value = weights && weights[name];
-      if (!Array.isArray(value) || value.length !== shape[0] || value.some(row => !Array.isArray(row) || row.length !== shape[1] || row.some(number => !Number.isFinite(number)))) {
-        throw new Error(`모델 가중치의 크기나 값이 올바르지 않습니다: ${name}`);
+    for (let layerIndex = 0; layerIndex < TRANSFORMER_LAYERS; layerIndex += 1) {
+      const layer = weights.layers[layerIndex];
+      const prefix = `layers[${layerIndex}]`;
+      validateExactKeys(
+        layer,
+        ["query", "key", "value", "attentionOutput", "feedForwardIn", "feedForwardInBias", "feedForwardOut", "feedForwardOutBias"],
+        prefix,
+      );
+      for (const name of ["query", "key", "value", "attentionOutput"]) {
+        validateMatrix(layer[name], d, d, `${prefix}.${name}`);
       }
+      validateMatrix(layer.feedForwardIn, d, h, `${prefix}.feedForwardIn`);
+      validateVector(layer.feedForwardInBias, h, `${prefix}.feedForwardInBias`);
+      validateMatrix(layer.feedForwardOut, h, d, `${prefix}.feedForwardOut`);
+      validateVector(layer.feedForwardOutBias, d, `${prefix}.feedForwardOutBias`);
     }
-    const vectorShapes = { feedForwardInBias: h, feedForwardOutBias: d, languageHeadBias: v };
-    for (const [name, length] of Object.entries(vectorShapes)) {
-      const value = weights[name];
-      if (!Array.isArray(value) || value.length !== length || value.some(number => !Number.isFinite(number))) {
-        throw new Error(`모델 편향값의 크기나 값이 올바르지 않습니다: ${name}`);
-      }
-    }
+    validatedModels.add(model);
     return model;
   }
 
   function forward(model, ids) {
-    const { dimension: d, hidden: h } = model.config;
+    const d = MODEL_DIMENSION;
     const weights = model.weights;
-    const length = ids.length;
-    const states = ids.map((id, position) =>
+    let states = ids.map((id, position) =>
       weights.tokenEmbedding[id].map((value, index) => value + weights.positionEmbedding[position][index]),
     );
-    const queries = states.map(state => matVec(weights.query, state));
-    const keys = states.map(state => matVec(weights.key, state));
-    const values = states.map(state => matVec(weights.value, state));
-    const attentions = [];
-    const attentionStates = [];
-    const residualStates = [];
-    const hiddenStates = [];
-    const outputs = [];
-    const logits = [];
+    const layerCaches = [];
 
-    for (let position = 0; position < length; position += 1) {
-      const scores = [];
-      for (let source = 0; source <= position; source += 1) {
-        let score = 0;
-        for (let index = 0; index < d; index += 1) score += queries[position][index] * keys[source][index];
-        scores.push(score / Math.sqrt(d));
+    for (const layerWeights of weights.layers) {
+      const queries = states.map(state => matVec(layerWeights.query, state));
+      const keys = states.map(state => matVec(layerWeights.key, state));
+      const values = states.map(state => matVec(layerWeights.value, state));
+      const attentions = [];
+      const attentionStates = [];
+      const residualStates = [];
+      const hiddenStates = [];
+      const outputs = [];
+
+      for (let position = 0; position < states.length; position += 1) {
+        const positionHeads = [];
+        const attended = zeros(d);
+        for (let head = 0; head < ATTENTION_HEADS; head += 1) {
+          const headStart = head * HEAD_DIMENSION;
+          const scores = [];
+          for (let source = 0; source <= position; source += 1) {
+            let score = 0;
+            for (let index = headStart; index < headStart + HEAD_DIMENSION; index += 1) {
+              score += queries[position][index] * keys[source][index];
+            }
+            scores.push(score / Math.sqrt(HEAD_DIMENSION));
+          }
+          const attention = softmax(scores);
+          positionHeads.push(attention);
+          for (let source = 0; source <= position; source += 1) {
+            for (let index = headStart; index < headStart + HEAD_DIMENSION; index += 1) {
+              attended[index] += attention[source] * values[source][index];
+            }
+          }
+        }
+        attentions.push(positionHeads);
+        attentionStates.push(attended);
+
+        const attentionOutput = matVec(layerWeights.attentionOutput, attended);
+        const residual = states[position].map((value, index) => value + attentionOutput[index]);
+        residualStates.push(residual);
+        const hidden = matVec(layerWeights.feedForwardIn, residual).map((value, index) =>
+          Math.max(0, value + layerWeights.feedForwardInBias[index]),
+        );
+        hiddenStates.push(hidden);
+        const feedForwardOutput = matVec(layerWeights.feedForwardOut, hidden);
+        const output = residual.map((value, index) =>
+          value + feedForwardOutput[index] + layerWeights.feedForwardOutBias[index],
+        );
+        outputs.push(output);
       }
-      const attention = softmax(scores);
-      attentions.push(attention);
-      const attended = zeros(d);
-      for (let source = 0; source <= position; source += 1) {
-        for (let index = 0; index < d; index += 1) attended[index] += attention[source] * values[source][index];
-      }
-      attentionStates.push(attended);
-      const attentionOutput = matVec(weights.attentionOutput, attended);
-      const residual = states[position].map((value, index) => value + attentionOutput[index]);
-      residualStates.push(residual);
-      const hiddenState = matVec(weights.feedForwardIn, residual).map((value, index) =>
-        Math.max(0, value + weights.feedForwardInBias[index]),
-      );
-      hiddenStates.push(hiddenState);
-      const feedForwardOutput = matVec(weights.feedForwardOut, hiddenState);
-      const output = residual.map((value, index) =>
-        value + feedForwardOutput[index] + weights.feedForwardOutBias[index],
-      );
-      outputs.push(output);
-      const tokenLogits = matVec(weights.languageHead, output).map((value, index) =>
-        value + weights.languageHeadBias[index],
-      );
-      logits.push(tokenLogits);
+
+      layerCaches.push({ states, queries, keys, values, attentions, attentionStates, residualStates, hiddenStates, outputs });
+      states = outputs;
     }
 
-    return { ids, length, states, queries, keys, values, attentions, attentionStates, residualStates, hiddenStates, outputs, logits };
+    const logits = states.map(state =>
+      matVec(weights.languageHead, state).map((value, index) => value + weights.languageHeadBias[index]),
+    );
+    return { ids, states, layerCaches, logits };
+  }
+
+  function zerosLike(value) {
+    if (Array.isArray(value)) return value.map(zerosLike);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, zerosLike(child)]));
+    }
+    return 0;
   }
 
   function gradientsFor(model) {
-    const weights = model.weights;
-    const gradients = {};
-    for (const [name, value] of Object.entries(weights)) {
-      gradients[name] = Array.isArray(value[0])
-        ? value.map(row => zeros(row.length))
-        : zeros(value.length);
-    }
-    return gradients;
+    return zerosLike(model.weights);
   }
 
   function backpropagate(model, cache, targets) {
-    const { dimension: d, hidden: h } = model.config;
     const weights = model.weights;
     const gradients = gradientsFor(model);
-    const stateGradients = Array.from({ length: cache.length }, () => zeros(d));
+    const d = MODEL_DIMENSION;
+    const h = FEED_FORWARD_DIMENSION;
+    const sequenceLength = cache.ids.length;
+    const stateGradients = Array.from({ length: sequenceLength }, () => zeros(d));
     let loss = 0;
     const scale = 1 / targets.length;
 
@@ -220,127 +281,151 @@
         const gradient = probabilities[token] * scale;
         gradients.languageHeadBias[token] += gradient;
         for (let index = 0; index < d; index += 1) {
-          gradients.languageHead[index][token] += cache.outputs[position][index] * gradient;
+          gradients.languageHead[index][token] += cache.states[position][index] * gradient;
           stateGradients[position][index] += weights.languageHead[index][token] * gradient;
         }
       }
     }
 
-    const attendedGradients = Array.from({ length: cache.length }, () => zeros(d));
-    for (let position = 0; position < cache.length; position += 1) {
-      const outputGradient = stateGradients[position];
-      const hiddenGradient = zeros(h);
-      addOuter(gradients.feedForwardOut, cache.hiddenStates[position], outputGradient);
-      for (let index = 0; index < d; index += 1) {
-        gradients.feedForwardOutBias[index] += outputGradient[index];
-      }
-      for (let hiddenIndex = 0; hiddenIndex < h; hiddenIndex += 1) {
-        let value = 0;
-        for (let index = 0; index < d; index += 1) {
-          value += weights.feedForwardOut[hiddenIndex][index] * outputGradient[index];
-        }
-        hiddenGradient[hiddenIndex] = cache.hiddenStates[position][hiddenIndex] > 0 ? value : 0;
-      }
+    for (let layerIndex = TRANSFORMER_LAYERS - 1; layerIndex >= 0; layerIndex -= 1) {
+      const layerWeights = weights.layers[layerIndex];
+      const layerGradients = gradients.layers[layerIndex];
+      const layerCache = cache.layerCaches[layerIndex];
+      const inputGradients = Array.from({ length: sequenceLength }, () => zeros(d));
+      const attendedGradients = Array.from({ length: sequenceLength }, () => zeros(d));
+      const queryGradients = Array.from({ length: sequenceLength }, () => zeros(d));
+      const keyGradients = Array.from({ length: sequenceLength }, () => zeros(d));
+      const valueGradients = Array.from({ length: sequenceLength }, () => zeros(d));
 
-      const residualGradient = outputGradient.slice();
-      addOuter(gradients.feedForwardIn, cache.residualStates[position], hiddenGradient);
-      for (let hiddenIndex = 0; hiddenIndex < h; hiddenIndex += 1) {
-        gradients.feedForwardInBias[hiddenIndex] += hiddenGradient[hiddenIndex];
-      }
-      for (let index = 0; index < d; index += 1) {
+      for (let position = 0; position < sequenceLength; position += 1) {
+        const outputGradient = stateGradients[position];
+        const hiddenGradient = zeros(h);
+        addOuter(layerGradients.feedForwardOut, layerCache.hiddenStates[position], outputGradient);
+        for (let index = 0; index < d; index += 1) {
+          layerGradients.feedForwardOutBias[index] += outputGradient[index];
+        }
         for (let hiddenIndex = 0; hiddenIndex < h; hiddenIndex += 1) {
-          residualGradient[index] += weights.feedForwardIn[index][hiddenIndex] * hiddenGradient[hiddenIndex];
+          let value = 0;
+          for (let index = 0; index < d; index += 1) {
+            value += layerWeights.feedForwardOut[hiddenIndex][index] * outputGradient[index];
+          }
+          hiddenGradient[hiddenIndex] = layerCache.hiddenStates[position][hiddenIndex] > 0 ? value : 0;
+        }
+
+        const residualGradient = outputGradient.slice();
+        addOuter(layerGradients.feedForwardIn, layerCache.residualStates[position], hiddenGradient);
+        for (let hiddenIndex = 0; hiddenIndex < h; hiddenIndex += 1) {
+          layerGradients.feedForwardInBias[hiddenIndex] += hiddenGradient[hiddenIndex];
+          for (let index = 0; index < d; index += 1) {
+            residualGradient[index] += layerWeights.feedForwardIn[index][hiddenIndex] * hiddenGradient[hiddenIndex];
+          }
+        }
+
+        inputGradients[position] = residualGradient.slice();
+        addOuter(layerGradients.attentionOutput, layerCache.attentionStates[position], residualGradient);
+        for (let inputIndex = 0; inputIndex < d; inputIndex += 1) {
+          for (let outputIndex = 0; outputIndex < d; outputIndex += 1) {
+            attendedGradients[position][inputIndex] +=
+              layerWeights.attentionOutput[inputIndex][outputIndex] * residualGradient[outputIndex];
+          }
         }
       }
 
-      stateGradients[position] = residualGradient;
-      addOuter(gradients.attentionOutput, cache.attentionStates[position], residualGradient);
-      for (let inputIndex = 0; inputIndex < d; inputIndex += 1) {
-        let value = 0;
-        for (let outputIndex = 0; outputIndex < d; outputIndex += 1) {
-          value += weights.attentionOutput[inputIndex][outputIndex] * residualGradient[outputIndex];
+      for (let position = 0; position < sequenceLength; position += 1) {
+        for (let head = 0; head < ATTENTION_HEADS; head += 1) {
+          const headStart = head * HEAD_DIMENSION;
+          const attention = layerCache.attentions[position][head];
+          const scoreGradients = [];
+          let weightedScoreGradient = 0;
+
+          for (let source = 0; source <= position; source += 1) {
+            for (let index = headStart; index < headStart + HEAD_DIMENSION; index += 1) {
+              valueGradients[source][index] += attention[source] * attendedGradients[position][index];
+            }
+            let gradient = 0;
+            for (let index = headStart; index < headStart + HEAD_DIMENSION; index += 1) {
+              gradient += attendedGradients[position][index] * layerCache.values[source][index];
+            }
+            scoreGradients.push(gradient);
+            weightedScoreGradient += attention[source] * gradient;
+          }
+
+          for (let source = 0; source <= position; source += 1) {
+            const scoreGradient = attention[source] *
+              (scoreGradients[source] - weightedScoreGradient) / Math.sqrt(HEAD_DIMENSION);
+            for (let index = headStart; index < headStart + HEAD_DIMENSION; index += 1) {
+              queryGradients[position][index] += scoreGradient * layerCache.keys[source][index];
+              keyGradients[source][index] += scoreGradient * layerCache.queries[position][index];
+            }
+          }
         }
-        attendedGradients[position][inputIndex] = value;
       }
+
+      for (let position = 0; position < sequenceLength; position += 1) {
+        addOuter(layerGradients.query, layerCache.states[position], queryGradients[position]);
+        addOuter(layerGradients.key, layerCache.states[position], keyGradients[position]);
+        addOuter(layerGradients.value, layerCache.states[position], valueGradients[position]);
+        for (let inputIndex = 0; inputIndex < d; inputIndex += 1) {
+          for (let outputIndex = 0; outputIndex < d; outputIndex += 1) {
+            inputGradients[position][inputIndex] +=
+              layerWeights.query[inputIndex][outputIndex] * queryGradients[position][outputIndex] +
+              layerWeights.key[inputIndex][outputIndex] * keyGradients[position][outputIndex] +
+              layerWeights.value[inputIndex][outputIndex] * valueGradients[position][outputIndex];
+          }
+        }
+      }
+      stateGradients.splice(0, sequenceLength, ...inputGradients);
     }
 
-    const queryGradients = Array.from({ length: cache.length }, () => zeros(d));
-    const keyGradients = Array.from({ length: cache.length }, () => zeros(d));
-    const valueGradients = Array.from({ length: cache.length }, () => zeros(d));
-
-    for (let position = 0; position < cache.length; position += 1) {
-      for (let source = 0; source <= position; source += 1) {
-        for (let index = 0; index < d; index += 1) {
-          valueGradients[source][index] += cache.attentions[position][source] * attendedGradients[position][index];
-        }
-      }
-    }
-
-    for (let position = 0; position < cache.length; position += 1) {
-      const attention = cache.attentions[position];
-      const scoreGradients = [];
-      let weightedScoreGradient = 0;
-      for (let source = 0; source <= position; source += 1) {
-        let gradient = 0;
-        for (let index = 0; index < d; index += 1) {
-          gradient += attendedGradients[position][index] * cache.values[source][index];
-        }
-        scoreGradients.push(gradient);
-        weightedScoreGradient += attention[source] * gradient;
-      }
-      for (let source = 0; source <= position; source += 1) {
-        const scoreGradient = attention[source] * (scoreGradients[source] - weightedScoreGradient) / Math.sqrt(d);
-        for (let index = 0; index < d; index += 1) {
-          queryGradients[position][index] += scoreGradient * cache.keys[source][index];
-          keyGradients[source][index] += scoreGradient * cache.queries[position][index];
-        }
-      }
-    }
-
-    for (let position = 0; position < cache.length; position += 1) {
-      addOuter(gradients.query, cache.states[position], queryGradients[position]);
-      addOuter(gradients.key, cache.states[position], keyGradients[position]);
-      addOuter(gradients.value, cache.states[position], valueGradients[position]);
-      const inputGradient = stateGradients[position];
+    for (let position = 0; position < sequenceLength; position += 1) {
+      const tokenGradient = gradients.tokenEmbedding[cache.ids[position]];
+      const positionGradient = gradients.positionEmbedding[position];
       for (let index = 0; index < d; index += 1) {
-        for (let outputIndex = 0; outputIndex < d; outputIndex += 1) {
-          inputGradient[index] +=
-            weights.query[index][outputIndex] * queryGradients[position][outputIndex] +
-            weights.key[index][outputIndex] * keyGradients[position][outputIndex] +
-            weights.value[index][outputIndex] * valueGradients[position][outputIndex];
-        }
+        tokenGradient[index] += stateGradients[position][index];
+        positionGradient[index] += stateGradients[position][index];
       }
-      addInto(gradients.tokenEmbedding[cache.ids[position]], inputGradient);
-      addInto(gradients.positionEmbedding[position], inputGradient);
     }
 
     let squaredNorm = 0;
-    for (const gradient of Object.values(gradients)) {
-      const values = Array.isArray(gradient[0]) ? gradient.flat() : gradient;
-      for (const value of values) squaredNorm += value * value;
-    }
-    const norm = Math.sqrt(squaredNorm);
-    const clipScale = norm > 1 ? 1 / norm : 1;
-    const learningRate = 0.08;
-    for (const [name, gradient] of Object.entries(gradients)) {
-      const weightsToUpdate = weights[name];
-      if (Array.isArray(gradient[0])) {
-        for (let row = 0; row < gradient.length; row += 1) {
-          for (let column = 0; column < gradient[row].length; column += 1) {
-            weightsToUpdate[row][column] -= learningRate * gradient[row][column] * clipScale;
-          }
-        }
+    function sumSquares(value) {
+      if (Array.isArray(value)) {
+        for (const child of value) sumSquares(child);
+      } else if (value && typeof value === "object") {
+        for (const child of Object.values(value)) sumSquares(child);
       } else {
-        for (let index = 0; index < gradient.length; index += 1) {
-          weightsToUpdate[index] -= learningRate * gradient[index] * clipScale;
-        }
+        squaredNorm += value * value;
       }
+    }
+    sumSquares(gradients);
+    const norm = Math.sqrt(squaredNorm);
+    if (!Number.isFinite(norm)) throw new Error("훈련 중 유효하지 않은 기울기가 발생했습니다. 학습 문장이나 훈련 횟수를 줄여 보세요.");
+    const clipScale = norm > 1 ? 1 / norm : 1;
+    const learningRate = 0.01;
+
+    function updateInPlace(parameter, gradient) {
+      if (Array.isArray(parameter)) {
+        for (let index = 0; index < parameter.length; index += 1) {
+          updateInPlace(parameter[index], gradient[index]);
+        }
+      } else if (parameter && typeof parameter === "object") {
+        for (const key of Object.keys(parameter)) updateInPlace(parameter[key], gradient[key]);
+      } else {
+        return parameter - learningRate * gradient * clipScale;
+      }
+      return parameter;
+    }
+    for (const key of Object.keys(weights)) {
+      weights[key] = updateInPlace(weights[key], gradients[key]);
     }
     return loss / targets.length;
   }
 
   function trainStep(model, corpus, contextLength = CONTEXT_LENGTH) {
-    validateModel(model);
+    if (!validatedModels.has(model)) validateModel(model);
+    if (typeof corpus !== "string") throw new Error("훈련 문장은 문자열이어야 합니다.");
+    if (!Number.isInteger(contextLength) || contextLength < 1 || contextLength > CONTEXT_LENGTH) {
+      throw new Error(`훈련 문맥은 1부터 ${CONTEXT_LENGTH}자 사이여야 합니다.`);
+    }
     const tokenMap = new Map(model.vocabulary.map((token, index) => [token, index]));
     const segments = [];
     let currentSegment = [];
@@ -396,8 +481,8 @@
       hidden: FEED_FORWARD_DIMENSION,
       context: CONTEXT_LENGTH,
       maxVocabulary: MAX_VOCABULARY_SIZE,
-      layers: 1,
-      heads: 1,
+      layers: TRANSFORMER_LAYERS,
+      heads: ATTENTION_HEADS,
     }),
     createModel,
     validateModel,
