@@ -4,10 +4,10 @@ const STORAGE_KEYS = {
 };
 const MODEL_DATABASE = "octo-ai-model-storage";
 const MODEL_STORE = "checkpoints";
-const MODEL_STORAGE_KEY = "latest-ko-word-ending-char-v1";
+const MODEL_STORAGE_KEY = "latest-ko-word-ending-char-5l-4h-256d-512c-5096v";
 const TRAINING_CHECKPOINT_INTERVAL = 25;
-const WEIGHTS_PACKAGE_FORMAT = "octo-mini-weights-package-v2";
-const MAX_WEIGHTS_FILE_BYTES = 20 * 1024 * 1024;
+const WEIGHTS_PACKAGE_FORMAT = "octo-mini-weights-package-v3";
+const MAX_WEIGHTS_FILE_BYTES = 128 * 1024 * 1024;
 
 const BUILT_IN_DOCUMENTS = [
   {
@@ -20,7 +20,7 @@ const BUILT_IN_DOCUMENTS = [
     id: "training-status",
     title: "모델 및 훈련 상태",
     url: "#training",
-    text: "훈련실은 단어 전체형, 등록된 어미, 문자 폴백을 사용하는 소형 한국어 디코더 트랜스포머를 CPU에서 다음 토큰 예측으로 훈련합니다. 이 미니 모델은 3개 층, 2개 어텐션 헤드, 차원 64, 문맥 216토큰, 최대 어휘 1,024개이며 일반적인 대화형 언어 모델이나 0.6B 모델이 아닙니다.",
+    text: "훈련실은 단어 전체형, 등록된 어미, 문자 폴백을 사용하는 한국어 디코더 트랜스포머를 CPU에서 다음 토큰 예측으로 훈련합니다. 모델은 5개 층, 4개 어텐션 헤드, 차원 256, 피드포워드 256, 문맥 512토큰, 최대 어휘 5,096개이며 약 471만 매개변수로 일반적인 대화형 언어 모델이나 0.6B 모델보다 작습니다.",
   },
   {
     id: "data-and-sources",
@@ -499,7 +499,7 @@ async function saveTrainingCheckpoint(writeConnectedFile = false) {
     const packageData = await makeWeightsPackage();
     const packageJSON = JSON.stringify(packageData);
     if (new TextEncoder().encode(packageJSON).byteLength > MAX_WEIGHTS_FILE_BYTES) {
-      throw new Error("가중치 패키지가 20MB 제한을 넘어 자동 저장하지 못했습니다.");
+      throw new Error("가중치 패키지가 128MB 제한을 넘어 자동 저장하지 못했습니다.");
     }
     await writeModelCheckpoint(packageJSON);
     if (writeConnectedFile && weightsFileHandle) {
@@ -550,7 +550,7 @@ async function initializeSavedTransformer() {
     if (!response.ok) throw new Error(`weights.json을 읽지 못했습니다 (HTTP ${response.status}).`);
     const contentLength = Number(response.headers.get("content-length"));
     if (Number.isFinite(contentLength) && contentLength > MAX_WEIGHTS_FILE_BYTES) {
-      throw new Error("배포된 weights.json이 20MB 제한을 넘었습니다.");
+      throw new Error("배포된 weights.json이 128MB 제한을 넘었습니다.");
     }
     const json = await response.text();
     const model = await readWeightsPackage(json);
@@ -712,11 +712,11 @@ async function makeWeightsPackage() {
 
 async function readWeightsPackage(json) {
   if (typeof json !== "string" || json.length > MAX_WEIGHTS_FILE_BYTES) {
-    throw new Error("가중치 JSON이 20MB 제한을 넘었습니다.");
+    throw new Error("가중치 JSON이 128MB 제한을 넘었습니다.");
   }
   const byteLength = new TextEncoder().encode(json).byteLength;
   if (byteLength > MAX_WEIGHTS_FILE_BYTES) {
-    throw new Error("가중치 파일이 20MB 제한을 넘었습니다.");
+    throw new Error("가중치 파일이 128MB 제한을 넘었습니다.");
   }
   const parsed = JSON.parse(json);
   const packageKeys = Object.keys(parsed || {}).sort();
@@ -750,7 +750,7 @@ document.querySelector("#export-transformer-weights").addEventListener("click", 
     const packageData = await makeWeightsPackage();
     const json = JSON.stringify(packageData, null, 2);
     if (new TextEncoder().encode(json).byteLength > MAX_WEIGHTS_FILE_BYTES) {
-      throw new Error("가중치 패키지가 20MB 제한을 넘었습니다.");
+      throw new Error("가중치 패키지가 128MB 제한을 넘었습니다.");
     }
     document.querySelector("#transformer-weights").value = json;
     const blob = new Blob([json], { type: "application/json" });
@@ -772,7 +772,7 @@ document.querySelector("#copy-transformer-weights").addEventListener("click", as
     const packageData = await makeWeightsPackage();
     const json = JSON.stringify(packageData, null, 2);
     if (new TextEncoder().encode(json).byteLength > MAX_WEIGHTS_FILE_BYTES) {
-      throw new Error("가중치 패키지가 20MB 제한을 넘었습니다.");
+      throw new Error("가중치 패키지가 128MB 제한을 넘었습니다.");
     }
     document.querySelector("#transformer-weights").value = json;
     if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
@@ -818,7 +818,7 @@ document.querySelector("#connect-weights-file").addEventListener("click", async 
     const permission = await handle.requestPermission({ mode: "readwrite" });
     if (permission !== "granted") throw new Error("선택한 파일에 대한 쓰기 권한이 허용되지 않았습니다.");
     const file = await handle.getFile();
-    if (file.size > MAX_WEIGHTS_FILE_BYTES) throw new Error("가중치 파일이 20MB 제한을 넘었습니다.");
+    if (file.size > MAX_WEIGHTS_FILE_BYTES) throw new Error("가중치 파일이 128MB 제한을 넘었습니다.");
     const json = await file.text();
     const imported = await readWeightsPackage(json);
     weightsFileHandle = handle;
@@ -845,7 +845,7 @@ document.querySelector("#transformer-weights-file").addEventListener("change", a
   if (!file) return;
   try {
     if (file.size > MAX_WEIGHTS_FILE_BYTES) {
-      throw new Error("가중치 파일이 20MB 제한을 넘었습니다.");
+      throw new Error("가중치 파일이 128MB 제한을 넘었습니다.");
     }
     const json = await file.text();
     document.querySelector("#transformer-weights").value = json;

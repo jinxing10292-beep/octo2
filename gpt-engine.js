@@ -1,15 +1,16 @@
 (function () {
   "use strict";
 
-  const FORMAT = "octo-mini-decoder-v3";
+  const FORMAT = "octo-mini-decoder-v4";
   const TOKENIZER = "ko-word-ending-char-v1";
-  const MODEL_DIMENSION = 64;
-  const ATTENTION_HEADS = 2;
+  const MODEL_DIMENSION = 256;
+  const ATTENTION_HEADS = 4;
   const HEAD_DIMENSION = MODEL_DIMENSION / ATTENTION_HEADS;
-  const FEED_FORWARD_DIMENSION = MODEL_DIMENSION * 2;
-  const TRANSFORMER_LAYERS = 3;
-  const CONTEXT_LENGTH = 216;
-  const MAX_VOCABULARY_SIZE = 1024;
+  const FEED_FORWARD_DIMENSION = 256;
+  const TRANSFORMER_LAYERS = 5;
+  const CONTEXT_LENGTH = 512;
+  const MAX_VOCABULARY_SIZE = 5096;
+  const MAX_CHARACTER_TOKENS = 1536;
   const WORD_PATTERN = /[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu;
   const HANGUL_FINAL_CONSONANTS = [
     null, "ㄱ", "ㄲ", "ㄳ", "ㄴ", "ㄵ", "ㄶ", "ㄷ", "ㄹ", "ㄺ", "ㄻ", "ㄼ",
@@ -86,10 +87,7 @@
         .sort((left, right) => right[1] - left[1])
         .map(([character]) => character),
     ];
-    const characterBudget = Math.min(
-      sortedCharacters.length,
-      MAX_VOCABULARY_SIZE - Math.min(256, endings.length + 16),
-    );
+    const characterBudget = Math.min(sortedCharacters.length, MAX_CHARACTER_TOKENS);
     const vocabulary = sortedCharacters.slice(0, characterBudget);
     for (const ending of endings) {
       if (vocabulary.length >= MAX_VOCABULARY_SIZE) break;
@@ -167,7 +165,7 @@
 
   function validateModel(model) {
     if (!model || model.format !== FORMAT || model.language !== "ko") {
-      throw new Error("지원하지 않는 가중치 형식입니다. 3층 모델 가중치 JSON인지 확인하세요.");
+      throw new Error("지원하지 않는 가중치 형식입니다. 현재 5층 혼합 토큰 모델의 가중치 JSON인지 확인하세요.");
     }
     validateExactKeys(model, ["format", "language", "tokenizer", "endings", "vocabulary", "config", "weights"], "모델");
     if (!Array.isArray(model.vocabulary) || model.vocabulary.length < 2 ||
@@ -198,7 +196,7 @@
         config.context !== CONTEXT_LENGTH || config.maxVocabulary !== MAX_VOCABULARY_SIZE ||
         config.layers !== TRANSFORMER_LAYERS || config.heads !== ATTENTION_HEADS ||
         config.objective !== "next-token-prediction" || model.tokenizer !== TOKENIZER) {
-      throw new Error("가중치의 모델 설정이 현재 3층·2헤드 구조와 일치하지 않습니다.");
+      throw new Error("가중치의 모델 설정이 현재 5층·4헤드 구조와 일치하지 않습니다.");
     }
     validateExactKeys(weights, ["tokenEmbedding", "positionEmbedding", "layers", "languageHead", "languageHeadBias"], "모델 가중치");
 
