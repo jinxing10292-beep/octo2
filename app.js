@@ -14,13 +14,13 @@ const BUILT_IN_DOCUMENTS = [
     id: "training-status",
     title: "모델 및 훈련 상태",
     url: "#training",
-    text: "현재 0.6B 모델의 가중치, 토크나이저, 실제 학습 엔진은 준비되어 있지 않습니다. 훈련 데이터 화면에서는 한국어 대화 예시를 브라우저 로컬 저장소에 저장하고 JSON 파일로 가져오거나 내보낼 수 있습니다. 이 화면은 실제 모델을 훈련하지 않으며 진행률을 시뮬레이션하지 않습니다.",
+    text: "훈련실은 무작위 초기화한 소형 문자 단위 디코더 트랜스포머를 CPU에서 다음 문자 예측으로 실제 훈련하고 가중치를 JSON으로 내보낼 수 있습니다. 이 미니 모델은 1개 층, 1개 어텐션 헤드, 은닉 차원 16, 문맥 32자 구조이며 일반적인 대화형 언어 모델이나 0.6B 모델이 아닙니다. 0.6B 모델의 훈련·추론에 필요한 자원은 별도로 마련해야 합니다. 훈련 데이터와 모델 가중치는 자동으로 저장되지 않으며 사용자가 내보내 보관해야 합니다.",
   },
   {
     id: "data-and-sources",
     title: "자료 및 출처 사용",
     url: "#sources",
-    text: "답변은 저장된 자료에서 찾은 내용에만 근거해야 합니다. 자료를 찾지 못하거나 질문과 자료의 관련성이 낮으면 추측하지 않고 모른다고 답합니다. 출처 표시는 답변 근거로 사용된 문서의 제목을 제공합니다. 사용자는 훈련 데이터 탭에서 별도의 한국어 예시를 관리할 수 있습니다.",
+    text: "채팅 화면의 검색 답변은 저장된 자료에서 찾은 내용에만 근거합니다. 자료를 찾지 못하거나 질문과 자료의 관련성이 낮으면 추측하지 않고 모른다고 답합니다. 별도 훈련실의 미니 언어 모델은 자료 검색 답변과 구분된 다음 문자 예측 실험이며, 일반적인 질의응답 능력을 보장하지 않습니다.",
   },
 ];
 
@@ -34,6 +34,9 @@ const exampleList = document.querySelector("#example-list");
 const datasetEmpty = document.querySelector("#dataset-empty");
 const toast = document.querySelector("#toast");
 let toastTimer;
+let transformerModel = null;
+let transformerTraining = false;
+let cancelTransformerTraining = false;
 
 function readStoredArray(key) {
   try {
@@ -410,6 +413,203 @@ document.querySelector("#import-file").addEventListener("change", async event =>
   }
 });
 
+function setTransformerModel(model, status = "모델 준비됨") {
+  transformerModel = window.OCTO_MINI_GPT.validateModel(model);
+  document.querySelector("#transformer-state").textContent =
+    `${status} · 문자 ${transformerModel.vocabulary.length}종`;
+  document.querySelector("#generate-transformer-sample").disabled = false;
+  document.querySelector("#export-transformer-weights").disabled = false;
+  document.querySelector("#copy-transformer-weights").disabled = false;
+}
+
+function setTransformerTrainingControls(isRunning) {
+  transformerTraining = isRunning;
+  document.querySelector("#start-transformer-training").disabled = isRunning;
+  document.querySelector("#initialize-transformer").disabled = isRunning;
+  document.querySelector("#use-examples-as-corpus").disabled = isRunning;
+  document.querySelector("#training-steps").disabled = isRunning;
+  document.querySelector("#stop-transformer-training").disabled = !isRunning;
+}
+
+document.querySelector("#use-examples-as-corpus").addEventListener("click", () => {
+  const examples = readStoredArray(STORAGE_KEYS.examples);
+  if (!examples.length) {
+    showToast("먼저 대화 예시를 추가하세요.");
+    return;
+  }
+  document.querySelector("#training-corpus").value = examples
+    .map(example => `사용자: ${example.prompt}\n답변: ${example.response}`)
+    .join("\n\n");
+  showToast(`${examples.length}개 대화 예시를 학습 문장에 넣었습니다.`);
+});
+
+function readTrainingCorpus() {
+  const corpus = document.querySelector("#training-corpus").value.trim();
+  if ([...corpus].length < 2) throw new Error("훈련 문장을 두 글자 이상 입력하세요.");
+  return corpus;
+}
+
+document.querySelector("#initialize-transformer").addEventListener("click", () => {
+  try {
+    const model = window.OCTO_MINI_GPT.createModel(readTrainingCorpus());
+    setTransformerModel(model, "무작위 초기화");
+    document.querySelector("#training-progress-fill").style.width = "0%";
+    document.querySelector("#training-status").textContent = "무작위 가중치 초기화 완료. 훈련 전에는 생성 결과가 무작위입니다.";
+    document.querySelector("#training-loss").textContent = "";
+    document.querySelector("#generation-output").textContent = "아직 훈련되지 않은 무작위 출력입니다.";
+  } catch (error) {
+    console.error("Could not initialize the mini transformer.", error);
+    showToast(error.message || "모델 초기화에 실패했습니다.");
+  }
+});
+
+document.querySelector("#start-transformer-training").addEventListener("click", () => {
+  let corpus;
+  let steps;
+  let vocabularyCoverage = 0;
+  try {
+    corpus = readTrainingCorpus();
+    steps = Number.parseInt(document.querySelector("#training-steps").value, 10);
+    if (!Number.isInteger(steps) || steps < 1 || steps > 3000) {
+      throw new Error("훈련 단계는 1부터 3000 사이의 정수여야 합니다.");
+    }
+    if (!transformerModel) {
+      transformerModel = window.OCTO_MINI_GPT.createModel(corpus);
+      setTransformerModel(transformerModel, "무작위 초기화");
+    } else {
+      window.OCTO_MINI_GPT.validateModel(transformerModel);
+    }
+    const modelVocabulary = new Set(transformerModel.vocabulary);
+    const corpusCharacters = [...corpus];
+    const knownCharacterCount = corpusCharacters.filter(character => modelVocabulary.has(character)).length;
+    const hasTrainablePair = corpusCharacters.some((character, index) =>
+      modelVocabulary.has(character) && modelVocabulary.has(corpusCharacters[index + 1]),
+    );
+    if (!hasTrainablePair) {
+      throw new Error("현재 모델 어휘와 겹치는 문자가 없습니다. 현재 문장으로 모델을 초기화하세요.");
+    }
+    vocabularyCoverage = Math.round((knownCharacterCount / corpusCharacters.length) * 100);
+  } catch (error) {
+    console.error("Could not start mini-transformer training.", error);
+    showToast(error.message || "훈련을 시작하지 못했습니다.");
+    return;
+  }
+
+  cancelTransformerTraining = false;
+  setTransformerTrainingControls(true);
+  document.querySelector("#training-progress-fill").style.width = "0%";
+  document.querySelector("#training-status").textContent = "다음 문자 예측으로 가중치를 갱신하는 중...";
+  document.querySelector("#training-loss").textContent = "";
+  const losses = [];
+  let step = 0;
+
+  const runStep = () => {
+    if (cancelTransformerTraining) {
+      setTransformerTrainingControls(false);
+      document.querySelector("#training-status").textContent = `훈련 중지 · ${step}/${steps}단계 완료`;
+      setTransformerModel(transformerModel, "부분 훈련됨");
+      return;
+    }
+    try {
+      losses.push(window.OCTO_MINI_GPT.trainStep(transformerModel, corpus));
+      step += 1;
+      const start = Math.max(0, losses.length - 25);
+      const recentLoss = losses.slice(start).reduce((sum, loss) => sum + loss, 0) / (losses.length - start);
+      document.querySelector("#training-progress-fill").style.width = `${(step / steps) * 100}%`;
+      document.querySelector("#training-status").textContent = `훈련 중 · ${step}/${steps}단계 · 어휘 적용률 ${vocabularyCoverage}%`;
+      document.querySelector("#training-loss").textContent = `최근 손실 ${recentLoss.toFixed(3)}`;
+      if (step < steps) {
+        window.setTimeout(runStep, 0);
+      } else {
+        setTransformerTrainingControls(false);
+        setTransformerModel(transformerModel, "훈련 완료");
+        document.querySelector("#training-status").textContent = `훈련 완료 · ${steps}단계 · 학습률 0.08`;
+        showToast("미니 트랜스포머 훈련을 마쳤습니다. 가중치를 JSON으로 내보내 보관하세요.");
+      }
+    } catch (error) {
+      console.error("Mini-transformer training failed.", error);
+      setTransformerTrainingControls(false);
+      document.querySelector("#training-status").textContent = "훈련에 실패했습니다.";
+      showToast(error.message || "훈련 도중 오류가 발생했습니다.");
+    }
+  };
+  window.setTimeout(runStep, 0);
+});
+
+document.querySelector("#stop-transformer-training").addEventListener("click", () => {
+  cancelTransformerTraining = true;
+  document.querySelector("#training-status").textContent = "현재 단계를 마친 뒤 중지합니다...";
+});
+
+document.querySelector("#generate-transformer-sample").addEventListener("click", () => {
+  if (!transformerModel) return;
+  try {
+    const prompt = document.querySelector("#generation-prompt").value;
+    const generated = window.OCTO_MINI_GPT.generate(transformerModel, prompt, 160, 0.8);
+    const modelVocabulary = new Set(transformerModel.vocabulary);
+    const ignoredPromptCharacters = [...prompt].filter(character => !modelVocabulary.has(character)).length;
+    document.querySelector("#generation-output").textContent = ignoredPromptCharacters
+      ? `${generated}\n\n(모델 어휘에 없는 시작 문자는 ${ignoredPromptCharacters}개 제외했습니다.)`
+      : generated;
+  } catch (error) {
+    console.error("Could not generate a mini-transformer sample.", error);
+    showToast(error.message || "문장 생성에 실패했습니다.");
+  }
+});
+
+function transformerWeightsJSON() {
+  if (!transformerModel) throw new Error("먼저 모델을 초기화하거나 훈련하세요.");
+  return JSON.stringify(transformerModel);
+}
+
+document.querySelector("#export-transformer-weights").addEventListener("click", () => {
+  try {
+    const json = JSON.stringify(transformerModel, null, 2);
+    document.querySelector("#transformer-weights").value = json;
+    const blob = new Blob([json], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "octo-mini-decoder-weights.json";
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    showToast("미니 트랜스포머 가중치를 JSON 파일로 내보냈습니다.");
+  } catch (error) {
+    console.error("Could not export mini-transformer weights.", error);
+    showToast(error.message || "가중치 내보내기에 실패했습니다.");
+  }
+});
+
+document.querySelector("#copy-transformer-weights").addEventListener("click", async () => {
+  try {
+    const json = transformerWeightsJSON();
+    document.querySelector("#transformer-weights").value = JSON.stringify(transformerModel, null, 2);
+    if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+      document.querySelector("#transformer-weights").focus();
+      document.querySelector("#transformer-weights").select();
+      throw new Error("브라우저 클립보드 권한을 사용할 수 없습니다. 선택된 JSON을 직접 복사하세요.");
+    }
+    await navigator.clipboard.writeText(json);
+    showToast("가중치 JSON을 클립보드에 복사했습니다.");
+  } catch (error) {
+    console.error("Could not copy mini-transformer weights.", error);
+    showToast(error.message || "가중치 복사에 실패했습니다.");
+  }
+});
+
+document.querySelector("#import-transformer-weights").addEventListener("click", () => {
+  try {
+    const imported = JSON.parse(document.querySelector("#transformer-weights").value);
+    setTransformerModel(imported, "JSON 불러옴");
+    document.querySelector("#training-status").textContent = "가중치를 불러왔습니다. 같은 어휘에 포함된 문장으로 이어서 훈련하거나 출력을 생성할 수 있습니다.";
+    document.querySelector("#generation-output").textContent = "가중치를 불러왔습니다. 시작 문구를 입력하고 생성을 눌러 보세요.";
+    showToast("가중치 JSON을 검증하고 불러왔습니다.");
+  } catch (error) {
+    console.error("Could not import mini-transformer weights.", error);
+    showToast(error.message || "가중치 JSON을 불러오지 못했습니다.");
+  }
+});
+
 function checkBrowserReadiness() {
   const supportsWebGPU = Boolean(navigator.gpu);
   document.querySelector("#webgpu-status").textContent = supportsWebGPU
@@ -428,7 +628,89 @@ function checkBrowserReadiness() {
   }
 }
 
+function normalizeVocabulary() {
+  const source = window.OCTO_KO_VOCABULARY;
+  const normalized = {};
+  for (const [category, definition] of Object.entries(source)) {
+    const entries = [];
+    if (definition.groups) {
+      for (const [group, words] of Object.entries(definition.groups)) {
+        for (const word of words.trim().split(/\s+/u)) {
+          entries.push({ word, group });
+        }
+      }
+    } else {
+      const wordList = [definition.items, definition.additional || "", definition.more || ""].filter(Boolean).join(" ");
+      for (const word of wordList.trim().split(/\s+/u)) {
+        entries.push({ word, group: "" });
+      }
+    }
+    const seen = new Set();
+    const uniqueEntries = entries.filter(entry => {
+      if ((category === "verbs" || category === "adjectives") && !entry.word.endsWith("-")) return false;
+      if (seen.has(entry.word)) return false;
+      seen.add(entry.word);
+      return true;
+    });
+    normalized[category] = {
+      label: definition.label,
+      entries: uniqueEntries.slice(0, 500),
+    };
+  }
+  return normalized;
+}
+
+const koreanVocabulary = normalizeVocabulary();
+const vocabularyCategory = document.querySelector("#vocabulary-category");
+const vocabularySearch = document.querySelector("#vocabulary-search");
+const vocabularyList = document.querySelector("#vocabulary-list");
+
+function renderVocabulary() {
+  const category = koreanVocabulary[vocabularyCategory.value];
+  const query = vocabularySearch.value.trim().toLocaleLowerCase("ko-KR");
+  const entries = category.entries.filter(entry => !query || entry.word.includes(query) || entry.group.includes(query));
+  vocabularyList.replaceChildren();
+  document.querySelector("#vocabulary-count").textContent = `${entries.length}개 / 전체 ${category.entries.length}개`;
+  if (!entries.length) {
+    const empty = document.createElement("p");
+    empty.className = "vocabulary-empty";
+    empty.textContent = "검색 결과가 없습니다.";
+    vocabularyList.append(empty);
+    return;
+  }
+  for (const entry of entries) {
+    const chip = document.createElement("span");
+    chip.className = "vocabulary-chip";
+    chip.textContent = entry.word;
+    if (entry.group) {
+      chip.title = entry.group;
+      chip.dataset.group = entry.group;
+    }
+    vocabularyList.append(chip);
+  }
+}
+
+vocabularyCategory.addEventListener("change", renderVocabulary);
+vocabularySearch.addEventListener("input", renderVocabulary);
+document.querySelector("#export-vocabulary").addEventListener("click", () => {
+  const data = Object.fromEntries(
+    Object.entries(koreanVocabulary).map(([key, category]) => [
+      key,
+      { label: category.label, entries: category.entries },
+    ]),
+  );
+  const blob = new Blob([JSON.stringify({ format: "octo-ai-korean-vocabulary-v1", language: "ko", categories: data }, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "octo-ai-korean-vocabulary.json";
+  link.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  showToast("품사별 한국어 어휘를 JSON으로 내보냈습니다.");
+});
+
 renderExamples();
 renderDocuments();
 checkBrowserReadiness();
+renderVocabulary();
 makeMessage("assistant", "안녕하세요! 저는 지금 저장된 자료를 검색해 근거와 함께 답하는 초기 프로토타입이에요. 아직 생성형 AI 모델은 연결되어 있지 않으니, 답을 자료에서 찾지 못하면 모른다고 말씀드릴게요.");

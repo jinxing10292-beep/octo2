@@ -7,6 +7,8 @@
     <meta name="description" content="한국어 대화와 출처 기반 검색을 실험하는 브라우저 AI 프로토타입">
     <title>Octo AI — 한국어 AI 실험실</title>
     <link rel="stylesheet" href="styles.css">
+    <script src="vocabulary-ko.js" defer></script>
+    <script src="gpt-engine.js" defer></script>
     <script src="app.js" defer></script>
   </head>
   <body>
@@ -82,17 +84,94 @@
 
         <section class="page" id="training-page" aria-labelledby="training-heading" hidden>
           <div class="training-wrap">
-            <div class="eyebrow"><span class="eyebrow-line"></span> DATA WORKSPACE</div>
+            <div class="eyebrow"><span class="eyebrow-line"></span> 훈련 작업 공간</div>
             <h1 id="training-heading">훈련 데이터<span class="accent-dot">.</span></h1>
             <p class="section-lead">한국어 예시를 작성하고 브라우저에 저장하세요. 여기서 모은 데이터는 파일로 내보내 별도 학습 환경에 전달할 수 있습니다.</p>
 
             <div class="notice-card">
               <div class="notice-icon" aria-hidden="true">i</div>
               <div>
-                <strong>실제 모델 학습은 아직 실행되지 않습니다</strong>
-                <p>0.6B 모델의 가중치·토크나이저·학습 엔진이 준비되지 않아, 이 페이지는 데이터 관리와 브라우저 기능 확인만 제공합니다. 학습을 실행하는 것처럼 보이는 가짜 진행률은 표시하지 않습니다.</p>
+                <strong>실제 훈련은 가능하지만, 0.6B 모델 훈련은 아닙니다</strong>
+                <p>아래 훈련실은 무작위 가중치에서 시작하는 작은 문자 단위 디코더 트랜스포머를 CPU로 실제 학습합니다. 다음 문자 예측 손실을 역전파하고 가중치를 JSON으로 내보낼 수 있습니다. 모델 크기와 문맥이 매우 작아 일반적인 대화형 LLM이나 0.6B 모델과 같은 성능을 내지 않습니다.</p>
               </div>
             </div>
+
+            <section class="panel transformer-panel" aria-labelledby="transformer-heading">
+              <div class="panel-heading">
+                <div>
+                  <div class="panel-kicker">브라우저 미니 트랜스포머</div>
+                  <h2 id="transformer-heading">실제 다음 문자 예측 훈련</h2>
+                </div>
+                <span class="count-badge" id="transformer-state">모델 없음</span>
+              </div>
+              <p class="panel-description">무작위 가중치로 시작하는 작은 인과적 디코더 트랜스포머입니다. 다음 문자 예측 손실을 역전파해 가중치를 갱신하고, 학습된 가중치로 이어 쓰기를 생성합니다. 일반적인 0.6B 모델이 아니며 학습 자료에 없던 지식을 스스로 알게 되지는 않습니다.</p>
+              <div class="transformer-specs" aria-label="미니 모델 설정">
+                <span>1개 층</span><span>1개 어텐션 헤드</span><span>차원 16</span><span>문맥 32자</span><span>문자 어휘 최대 256</span><span>자바스크립트 CPU</span>
+              </div>
+              <label class="training-label" for="training-corpus">한국어 학습 문장</label>
+              <textarea id="training-corpus" class="training-corpus" rows="8" maxlength="30000" placeholder="훈련할 문장이나 문서를 입력하세요. 반복 횟수만 늘려도 자료의 정보량은 늘지 않습니다."></textarea>
+              <div class="training-controls">
+                <button class="secondary-button" id="use-examples-as-corpus" type="button">대화 예시 불러오기</button>
+                <label class="step-control" for="training-steps">훈련 단계
+                  <input id="training-steps" type="number" min="1" max="3000" value="100">
+                </label>
+                <button class="secondary-button" id="initialize-transformer" type="button">무작위 모델 초기화</button>
+                <button class="primary-button" id="start-transformer-training" type="button">훈련 시작</button>
+                <button class="secondary-button" id="stop-transformer-training" type="button" disabled>중지</button>
+              </div>
+              <div class="training-progress" aria-live="polite">
+                <div class="progress-track"><div class="progress-fill" id="training-progress-fill"></div></div>
+                <div class="progress-caption"><span id="training-status">모델을 초기화하거나 훈련을 시작하세요.</span><span id="training-loss"></span></div>
+              </div>
+              <div class="training-sample">
+                <div class="training-subheading">
+                  <div><div class="panel-kicker">모델 출력 실험</div><h3>이어 쓰기 생성</h3></div>
+                  <button class="secondary-button" id="generate-transformer-sample" type="button" disabled>생성하기</button>
+                </div>
+                <label class="training-label" for="generation-prompt">시작 문구</label>
+                <input id="generation-prompt" type="text" maxlength="200" value="한국어" placeholder="모델 어휘에 포함된 시작 문구">
+                <pre class="generation-output" id="generation-output" aria-live="polite">학습한 모델의 출력이 여기에 표시됩니다.</pre>
+              </div>
+              <div class="weights-panel">
+                <div class="training-subheading">
+                  <div><div class="panel-kicker">가중치 전송</div><h3>내보내기 · 복사 · 붙여넣기</h3></div>
+                  <div class="weights-actions">
+                    <button class="secondary-button" id="export-transformer-weights" type="button" disabled>JSON 다운로드</button>
+                    <button class="secondary-button" id="copy-transformer-weights" type="button" disabled>JSON 복사</button>
+                    <button class="secondary-button" id="import-transformer-weights" type="button">JSON 적용</button>
+                  </div>
+                </div>
+                <label class="sr-only" for="transformer-weights">모델 가중치 JSON</label>
+                <textarea id="transformer-weights" class="weights-json" rows="5" spellcheck="false" placeholder="JSON 가중치를 여기에 붙여넣고 ‘JSON 적용’을 누르세요. 내보내기를 누르면 현재 가중치가 여기에 표시됩니다."></textarea>
+                <p class="form-help">가중치는 이 브라우저에 자동 저장되지 않습니다. JSON을 직접 보관하세요. 이 미니 모델의 가중치는 실제 0.6B 모델의 가중치와 호환되지 않습니다.</p>
+              </div>
+            </section>
+
+            <section class="panel vocabulary-panel" aria-labelledby="vocabulary-heading">
+              <div class="panel-heading">
+                <div>
+                  <div class="panel-kicker">한국어 기본 어휘</div>
+                  <h2 id="vocabulary-heading">품사별 어휘</h2>
+                </div>
+                <button class="secondary-button" id="export-vocabulary" type="button">어휘 JSON 내보내기 ↗</button>
+              </div>
+              <p class="panel-description">명사·동사·형용사·부사는 기본형으로, 용언은 어미를 뗀 어간으로 저장합니다. 조사와 어미는 실제 쓰이는 항목만 별도 분류합니다.</p>
+              <div class="vocabulary-controls">
+                <label class="sr-only" for="vocabulary-category">품사 선택</label>
+                <select id="vocabulary-category">
+                  <option value="nouns">명사</option>
+                  <option value="verbs">동사 어간</option>
+                  <option value="adjectives">형용사 어간</option>
+                  <option value="adverbs">부사</option>
+                  <option value="particles">조사</option>
+                  <option value="endings">어미</option>
+                </select>
+                <label class="sr-only" for="vocabulary-search">어휘 검색</label>
+                <input id="vocabulary-search" type="search" placeholder="어휘 검색">
+                <span class="count-badge" id="vocabulary-count">0개</span>
+              </div>
+              <div class="vocabulary-list" id="vocabulary-list" aria-live="polite"></div>
+            </section>
 
             <section class="panel knowledge-panel" aria-labelledby="knowledge-heading">
               <div class="panel-heading">
@@ -184,7 +263,7 @@
 
             <footer class="training-footer">
               <span class="status-dot"></span>
-              <span><strong>다음 단계:</strong> 토크나이저와 모델 구조를 정하고, 학습이 가능한 별도 실행 환경을 연결하세요.</span>
+              <span><strong>0.6B 목표:</strong> 이 미니 모델은 동작 검증용입니다. 0.6B 학습에는 별도의 데이터·메모리·연산 환경이 필요합니다.</span>
             </footer>
           </div>
         </section>

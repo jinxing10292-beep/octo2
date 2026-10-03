@@ -175,6 +175,37 @@ h1, h2, p { margin-top: 0; }
 .training-grid { display: grid; grid-template-columns: 1.15fr .85fr; gap: 15px; margin-top: 17px; }
 .panel { border: 1px solid var(--line); border-radius: 11px; background: var(--panel); }
 .dataset-panel, .readiness-panel, .examples-panel { padding: 18px 19px; }
+.transformer-panel { margin-top: 15px; padding: 19px; }
+.transformer-specs { display: flex; flex-wrap: wrap; gap: 6px; margin: 11px 0 17px; }
+.transformer-specs span { padding: 5px 8px; border: 1px solid #eeedf4; border-radius: 14px; color: #777b8a; background: #fcfcfe; font-size: 9px; }
+.training-label { display: block; margin: 0 0 6px; color: #696d7d; font-size: 10px; font-weight: 600; }
+.training-corpus, .weights-json { display: block; width: 100%; padding: 10px; resize: vertical; border: 1px solid #e9e9ef; border-radius: 7px; outline: 0; color: #414556; background: #fdfdfe; font: inherit; font-size: 10px; line-height: 1.65; }
+.training-corpus:focus, .weights-json:focus, .training-sample input:focus { border-color: #c8c0ff; }
+.training-corpus::placeholder, .weights-json::placeholder { color: #b3b5c0; }
+.training-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
+.step-control { display: inline-flex; align-items: center; gap: 7px; color: #858897; font-size: 9px; }
+.step-control input { width: 67px; height: 30px; padding: 0 7px; border: 1px solid #e7e7ed; border-radius: 6px; color: #676b7b; background: #fff; font: inherit; font-size: 10px; }
+.training-controls button:disabled, .training-subheading button:disabled { cursor: not-allowed; opacity: .45; }
+.training-progress { margin-top: 14px; }
+.progress-track { height: 5px; overflow: hidden; border-radius: 5px; background: #f0eff5; }
+.progress-fill { width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #8b7af2, #5d4bd7); transition: width .12s linear; }
+.progress-caption { display: flex; justify-content: space-between; gap: 10px; margin-top: 6px; color: #999cab; font-size: 9px; }
+.training-sample, .weights-panel { margin-top: 18px; padding-top: 15px; border-top: 1px solid #f0f0f4; }
+.training-subheading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 11px; }
+.training-subheading h3 { margin: 4px 0 0; color: #4c5060; font-size: 12px; font-weight: 600; }
+.training-sample input { width: 100%; height: 34px; margin-bottom: 8px; padding: 0 9px; border: 1px solid #e9e9ef; border-radius: 6px; outline: 0; color: #414556; background: #fdfdfe; font: inherit; font-size: 10px; }
+.generation-output { min-height: 72px; max-height: 220px; overflow: auto; margin: 0; padding: 10px; border: 1px solid #f0f0f4; border-radius: 7px; color: #666a7a; background: #fafafd; font: inherit; font-size: 10px; line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; }
+.weights-actions { display: flex; flex-wrap: wrap; gap: 5px; }
+.weights-panel > .form-help { display: block; margin-top: 7px; line-height: 1.6; }
+.vocabulary-panel { margin-top: 15px; padding: 18px 19px; }
+.vocabulary-controls { display: flex; align-items: center; gap: 8px; margin: 13px 0 12px; }
+.vocabulary-controls select, .vocabulary-controls input { min-width: 0; height: 33px; padding: 0 9px; border: 1px solid #e9e9ef; border-radius: 6px; outline: 0; color: #696d7d; background: #fff; font: inherit; font-size: 10px; }
+.vocabulary-controls select:focus, .vocabulary-controls input:focus { border-color: #c8c0ff; }
+.vocabulary-controls input { flex: 1; }
+.vocabulary-controls .count-badge { white-space: nowrap; }
+.vocabulary-list { display: flex; flex-wrap: wrap; gap: 6px; max-height: 260px; overflow: auto; padding: 2px 2px 4px; }
+.vocabulary-chip { padding: 6px 8px; border: 1px solid #eeedf4; border-radius: 6px; color: #666a7a; background: #fcfcfe; font-size: 10px; line-height: 1.25; }
+.vocabulary-empty { width: 100%; margin: 12px 0; color: #999cab; font-size: 10px; text-align: center; }
 .panel-heading { display: flex; align-items: center; justify-content: space-between; }
 .panel-kicker { font-size: 9px; letter-spacing: 1.25px; }
 .panel h2 { margin: 5px 0 0; font-size: 15px; font-weight: 600; letter-spacing: -.35px; }
@@ -261,6 +292,7 @@ h1, h2, p { margin-top: 0; }
   .suggestions { justify-content: flex-start; }
   .suggestion { font-size: 9px; }
   .dataset-panel, .readiness-panel, .examples-panel { padding: 15px 13px; }
+  .vocabulary-panel { padding: 15px 13px; }
   .knowledge-panel { padding: 15px 13px; }
   .document-form-row { grid-template-columns: 1fr; gap: 0; }
   .form-help { max-width: 145px; line-height: 1.5; }
