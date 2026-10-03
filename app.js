@@ -2,6 +2,12 @@ const STORAGE_KEYS = {
   examples: "octo-ai-training-examples-v1",
   documents: "octo-ai-local-documents-v1",
 };
+const MODEL_DATABASE = "octo-ai-model-storage";
+const MODEL_STORE = "checkpoints";
+const MODEL_STORAGE_KEY = "latest-ko-word-ending-char-v1";
+const TRAINING_CHECKPOINT_INTERVAL = 25;
+const WEIGHTS_PACKAGE_FORMAT = "octo-mini-weights-package-v2";
+const MAX_WEIGHTS_FILE_BYTES = 20 * 1024 * 1024;
 
 const BUILT_IN_DOCUMENTS = [
   {
@@ -14,13 +20,13 @@ const BUILT_IN_DOCUMENTS = [
     id: "training-status",
     title: "모델 및 훈련 상태",
     url: "#training",
-    text: "훈련실은 무작위 초기화한 소형 문자 단위 디코더 트랜스포머를 CPU에서 다음 문자 예측으로 실제 훈련하고 가중치를 JSON으로 내보낼 수 있습니다. 이 미니 모델은 3개 층, 2개 어텐션 헤드, 차원 64, 문맥 216자, 문자 어휘 최대 1,024개 구조이며 일반적인 대화형 언어 모델이나 0.6B 모델이 아닙니다. 0.6B 모델의 훈련·추론에 필요한 자원은 별도로 마련해야 합니다. 훈련 데이터와 모델 가중치는 자동으로 저장되지 않으며 사용자가 내보내 보관해야 합니다.",
+    text: "훈련실은 단어 전체형, 등록된 어미, 문자 폴백을 사용하는 소형 한국어 디코더 트랜스포머를 CPU에서 다음 토큰 예측으로 훈련합니다. 이 미니 모델은 3개 층, 2개 어텐션 헤드, 차원 64, 문맥 216토큰, 최대 어휘 1,024개이며 일반적인 대화형 언어 모델이나 0.6B 모델이 아닙니다.",
   },
   {
     id: "data-and-sources",
     title: "자료 및 출처 사용",
     url: "#sources",
-    text: "채팅 화면의 검색 답변은 저장된 자료에서 찾은 내용에만 근거합니다. 자료를 찾지 못하거나 질문과 자료의 관련성이 낮으면 추측하지 않고 모른다고 답합니다. 별도 훈련실의 미니 언어 모델은 자료 검색 답변과 구분된 다음 문자 예측 실험이며, 일반적인 질의응답 능력을 보장하지 않습니다.",
+    text: "채팅 화면의 검색 답변은 저장된 자료에서 찾은 내용에만 근거합니다. 자료를 찾지 못하거나 질문과 자료의 관련성이 낮으면 추측하지 않고 모른다고 답합니다. 별도 훈련실의 미니 언어 모델은 자료 검색 답변과 구분된 단어·어미·문자 혼합 토큰의 다음 토큰 예측 실험이며, 일반적인 질의응답 능력을 보장하지 않습니다.",
   },
 ];
 
@@ -36,8 +42,7 @@ const toast = document.querySelector("#toast");
 let toastTimer;
 let transformerModel = null;
 let cancelTransformerTraining = false;
-const WEIGHTS_PACKAGE_FORMAT = "octo-mini-weights-package-v1";
-const MAX_WEIGHTS_FILE_BYTES = 20 * 1024 * 1024;
+let weightsFileHandle = null;
 
 function readStoredArray(key) {
   try {
@@ -418,7 +423,7 @@ function setTransformerModel(model, status = "모델 준비됨") {
   transformerModel = window.OCTO_MINI_GPT.validateModel(model);
   const parameterCount = countParameters(transformerModel.weights);
   document.querySelector("#transformer-state").textContent =
-    `${status} · 문자 ${transformerModel.vocabulary.length}종 · ${parameterCount.toLocaleString("ko-KR")}개 매개변수`;
+    `${status} · 토큰 ${transformerModel.vocabulary.length}종 · ${parameterCount.toLocaleString("ko-KR")}개 매개변수`;
   document.querySelector("#generate-transformer-sample").disabled = false;
   document.querySelector("#export-transformer-weights").disabled = false;
   document.querySelector("#copy-transformer-weights").disabled = false;
@@ -435,9 +440,129 @@ function countParameters(value) {
 function setTransformerTrainingControls(isRunning) {
   document.querySelector("#start-transformer-training").disabled = isRunning;
   document.querySelector("#initialize-transformer").disabled = isRunning;
+  document.querySelector("#connect-weights-file").disabled = isRunning;
   document.querySelector("#use-examples-as-corpus").disabled = isRunning;
   document.querySelector("#training-steps").disabled = isRunning;
   document.querySelector("#stop-transformer-training").disabled = !isRunning;
+}
+
+function openModelDatabase() {
+  if (!("indexedDB" in window)) return Promise.reject(new Error("이 브라우저는 IndexedDB 모델 저장을 지원하지 않습니다."));
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(MODEL_DATABASE, 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(MODEL_STORE)) {
+        request.result.createObjectStore(MODEL_STORE);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("모델 저장소를 열지 못했습니다."));
+  });
+}
+
+async function writeModelCheckpoint(packageJSON) {
+  const database = await openModelDatabase();
+  try {
+    await new Promise((resolve, reject) => {
+      const transaction = database.transaction(MODEL_STORE, "readwrite");
+      transaction.objectStore(MODEL_STORE).put(packageJSON, MODEL_STORAGE_KEY);
+      transaction.oncomplete = resolve;
+      transaction.onerror = () => reject(transaction.error || new Error("모델 체크포인트를 저장하지 못했습니다."));
+      transaction.onabort = () => reject(transaction.error || new Error("모델 체크포인트 저장이 중단되었습니다."));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+async function readModelCheckpoint() {
+  const database = await openModelDatabase();
+  try {
+    return await new Promise((resolve, reject) => {
+      const transaction = database.transaction(MODEL_STORE, "readonly");
+      const request = transaction.objectStore(MODEL_STORE).get(MODEL_STORAGE_KEY);
+      request.onsuccess = () => resolve(request.result || null);
+      request.onerror = () => reject(request.error || new Error("저장된 모델 체크포인트를 읽지 못했습니다."));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+function setWeightsSaveStatus(message) {
+  document.querySelector("#weights-save-status").textContent = message;
+}
+
+async function saveTrainingCheckpoint(writeConnectedFile = false) {
+  if (!transformerModel) return false;
+  try {
+    const packageData = await makeWeightsPackage();
+    const packageJSON = JSON.stringify(packageData);
+    if (new TextEncoder().encode(packageJSON).byteLength > MAX_WEIGHTS_FILE_BYTES) {
+      throw new Error("가중치 패키지가 20MB 제한을 넘어 자동 저장하지 못했습니다.");
+    }
+    await writeModelCheckpoint(packageJSON);
+    if (writeConnectedFile && weightsFileHandle) {
+      const permission = await weightsFileHandle.queryPermission({ mode: "readwrite" });
+      if (permission !== "granted") {
+        throw new Error("연결한 가중치 파일의 쓰기 권한이 만료됐습니다. 파일을 다시 연결하세요.");
+      }
+      const writable = await weightsFileHandle.createWritable();
+      try {
+        await writable.write(`${JSON.stringify(packageData, null, 2)}\n`);
+        await writable.close();
+      } catch (error) {
+        await writable.abort();
+        throw error;
+      }
+      setWeightsSaveStatus("이 브라우저의 IndexedDB와 연결한 weights.json 파일에 저장했습니다.");
+    } else {
+      setWeightsSaveStatus("이 브라우저의 IndexedDB에 체크포인트를 저장했습니다.");
+    }
+    return true;
+  } catch (error) {
+    console.error("Could not save mini-transformer checkpoint.", error);
+    setWeightsSaveStatus(`자동 저장 오류: ${error.message || "체크포인트를 저장하지 못했습니다."}`);
+    return false;
+  }
+}
+
+async function initializeSavedTransformer() {
+  const status = document.querySelector("#training-status");
+  status.textContent = "저장된 모델 가중치를 확인하는 중...";
+  try {
+    const savedPackage = await readModelCheckpoint();
+    if (savedPackage) {
+      const model = await readWeightsPackage(savedPackage);
+      setTransformerModel(model, "자동 저장 모델");
+      status.textContent = "이 브라우저에 저장된 가중치를 불러왔습니다. 이어서 훈련할 수 있습니다.";
+      setWeightsSaveStatus("이 브라우저에 저장된 체크포인트를 불러왔습니다. 이어서 훈련하면 기존 가중치가 갱신됩니다.");
+      setTransformerTrainingControls(false);
+      return;
+    }
+  } catch (error) {
+    console.error("Could not restore the local model checkpoint.", error);
+    setWeightsSaveStatus(`저장된 체크포인트를 불러오지 못했습니다: ${error.message || "저장소 오류"}`);
+  }
+
+  try {
+    const response = await fetch("./weights.json", { cache: "no-cache" });
+    if (!response.ok) throw new Error(`weights.json을 읽지 못했습니다 (HTTP ${response.status}).`);
+    const contentLength = Number(response.headers.get("content-length"));
+    if (Number.isFinite(contentLength) && contentLength > MAX_WEIGHTS_FILE_BYTES) {
+      throw new Error("배포된 weights.json이 20MB 제한을 넘었습니다.");
+    }
+    const json = await response.text();
+    const model = await readWeightsPackage(json);
+    setTransformerModel(model, "weights.json 불러옴");
+    status.textContent = "배포된 weights.json을 불러왔습니다. 훈련을 시작하면 기존 가중치에서 이어 학습합니다.";
+    setWeightsSaveStatus("배포된 weights.json을 불러왔습니다. 훈련 체크포인트는 이 브라우저에 자동 저장됩니다.");
+  } catch (error) {
+    console.error("Could not load bundled weights.json.", error);
+    status.textContent = "기존 가중치를 불러오지 못했습니다. JSON 파일을 선택하거나 무작위 모델을 초기화하세요.";
+    setWeightsSaveStatus(`weights.json 자동 불러오기 실패: ${error.message || "모델을 검증하지 못했습니다."}`);
+  }
+  setTransformerTrainingControls(false);
 }
 
 document.querySelector("#use-examples-as-corpus").addEventListener("click", () => {
@@ -488,14 +613,11 @@ document.querySelector("#start-transformer-training").addEventListener("click", 
     } else {
       window.OCTO_MINI_GPT.validateModel(transformerModel);
     }
-    const modelVocabulary = new Set(transformerModel.vocabulary);
+    const tokenization = window.OCTO_MINI_GPT.tokenize(transformerModel, corpus);
     const corpusCharacters = [...corpus];
-    const knownCharacterCount = corpusCharacters.filter(character => modelVocabulary.has(character)).length;
-    const hasTrainablePair = corpusCharacters.some((character, index) =>
-      modelVocabulary.has(character) && modelVocabulary.has(corpusCharacters[index + 1]),
-    );
-    if (!hasTrainablePair) {
-      throw new Error("현재 모델 어휘에서 연속된 훈련 문자를 찾지 못했습니다. 문장에 문자를 추가하거나 현재 문장으로 모델을 초기화하세요.");
+    const knownCharacterCount = corpusCharacters.length - tokenization.unknownCharacters;
+    if (!tokenization.segments.some(segment => segment.length > 1)) {
+      throw new Error("현재 모델 어휘에서 이어지는 훈련 토큰을 찾지 못했습니다. 새 단어나 문자를 추가하거나 현재 문장으로 모델을 초기화하세요.");
     }
     vocabularyCoverage = Math.round((knownCharacterCount / corpusCharacters.length) * 100);
   } catch (error) {
@@ -507,21 +629,25 @@ document.querySelector("#start-transformer-training").addEventListener("click", 
   cancelTransformerTraining = false;
   setTransformerTrainingControls(true);
   document.querySelector("#training-progress-fill").style.width = "0%";
-  document.querySelector("#training-status").textContent = "다음 문자 예측으로 가중치를 갱신하는 중...";
+  document.querySelector("#training-status").textContent = "다음 토큰 예측으로 가중치를 갱신하는 중...";
   document.querySelector("#training-loss").textContent = "";
   const losses = [];
   let step = 0;
 
-  const runStep = () => {
+  const runStep = async () => {
     if (cancelTransformerTraining) {
       setTransformerTrainingControls(false);
       document.querySelector("#training-status").textContent = `훈련 중지 · ${step}/${steps}단계 완료`;
       setTransformerModel(transformerModel, "부분 훈련됨");
+      await saveTrainingCheckpoint(true);
       return;
     }
     try {
       losses.push(window.OCTO_MINI_GPT.trainStep(transformerModel, corpus));
       step += 1;
+      if (step % TRAINING_CHECKPOINT_INTERVAL === 0 && step < steps) {
+        await saveTrainingCheckpoint(false);
+      }
       const start = Math.max(0, losses.length - 25);
       const recentLoss = losses.slice(start).reduce((sum, loss) => sum + loss, 0) / (losses.length - start);
       document.querySelector("#training-progress-fill").style.width = `${(step / steps) * 100}%`;
@@ -532,8 +658,11 @@ document.querySelector("#start-transformer-training").addEventListener("click", 
       } else {
         setTransformerTrainingControls(false);
         setTransformerModel(transformerModel, "훈련 완료");
-        document.querySelector("#training-status").textContent = `훈련 완료 · ${steps}단계 · 학습률 0.08`;
-        showToast("미니 트랜스포머 훈련을 마쳤습니다. 가중치를 JSON으로 내보내 보관하세요.");
+        document.querySelector("#training-status").textContent = `훈련 완료 · ${steps}단계 · 학습률 0.01`;
+        const saved = await saveTrainingCheckpoint(true);
+        showToast(saved
+          ? "훈련이 완료됐고 기존 가중치에 이어 학습한 모델을 저장했습니다."
+          : "훈련은 완료됐지만 자동 저장에 실패했습니다. 오류를 확인하고 가중치를 내려받으세요.");
       }
     } catch (error) {
       console.error("Mini-transformer training failed.", error);
@@ -554,9 +683,8 @@ document.querySelector("#generate-transformer-sample").addEventListener("click",
   if (!transformerModel) return;
   try {
     const prompt = document.querySelector("#generation-prompt").value;
-    const generated = window.OCTO_MINI_GPT.generate(transformerModel, prompt, 160, 0.8);
-    const modelVocabulary = new Set(transformerModel.vocabulary);
-    const ignoredPromptCharacters = [...prompt].filter(character => !modelVocabulary.has(character)).length;
+    const generated = window.OCTO_MINI_GPT.generate(transformerModel, prompt, 40, 0.8);
+    const ignoredPromptCharacters = window.OCTO_MINI_GPT.tokenize(transformerModel, prompt).unknownCharacters;
     document.querySelector("#generation-output").textContent = ignoredPromptCharacters
       ? `${generated}\n\n(모델 어휘에 없는 시작 문자는 ${ignoredPromptCharacters}개 제외했습니다.)`
       : generated;
@@ -673,9 +801,40 @@ async function importTransformerWeights(json) {
   const imported = await readWeightsPackage(json);
   setTransformerModel(imported, "JSON 불러옴");
   document.querySelector("#training-status").textContent = "가중치를 불러왔습니다. 같은 어휘에 포함된 문장으로 이어서 훈련하거나 출력을 생성할 수 있습니다.";
+  await saveTrainingCheckpoint(false);
   document.querySelector("#generation-output").textContent = "가중치를 불러왔습니다. 시작 문구를 입력하고 생성을 눌러 보세요.";
   showToast("SHA-256 및 모델 구조 검증을 통과한 가중치를 불러왔습니다.");
 }
+
+document.querySelector("#connect-weights-file").addEventListener("click", async () => {
+  try {
+    if (typeof window.showOpenFilePicker !== "function") {
+      throw new Error("이 브라우저는 파일 직접 저장을 지원하지 않습니다. Chrome 또는 Edge에서 HTTPS로 열어 주세요.");
+    }
+    const [handle] = await window.showOpenFilePicker({
+      multiple: false,
+      types: [{ description: "Octo 가중치 JSON", accept: { "application/json": [".json"] } }],
+    });
+    const permission = await handle.requestPermission({ mode: "readwrite" });
+    if (permission !== "granted") throw new Error("선택한 파일에 대한 쓰기 권한이 허용되지 않았습니다.");
+    const file = await handle.getFile();
+    if (file.size > MAX_WEIGHTS_FILE_BYTES) throw new Error("가중치 파일이 20MB 제한을 넘었습니다.");
+    const json = await file.text();
+    const imported = await readWeightsPackage(json);
+    weightsFileHandle = handle;
+    setTransformerModel(imported, "weights.json 연결됨");
+    document.querySelector("#training-status").textContent = "선택한 weights.json의 가중치를 불러왔습니다. 다음 훈련은 이 가중치에서 이어집니다.";
+    const checkpointSaved = await saveTrainingCheckpoint(false);
+    if (checkpointSaved) {
+      setWeightsSaveStatus("브라우저 체크포인트를 갱신했고, 선택한 로컬 weights.json에도 훈련 완료 시 결과를 기록합니다.");
+    }
+    showToast("가중치 파일을 검증하고 연결했습니다.");
+  } catch (error) {
+    if (error.name === "AbortError") return;
+    console.error("Could not connect weights file.", error);
+    showToast(error.message || "가중치 파일을 연결하지 못했습니다.");
+  }
+});
 
 document.querySelector("#select-transformer-weights").addEventListener("click", () => {
   document.querySelector("#transformer-weights-file").click();
@@ -729,10 +888,21 @@ function normalizeVocabulary() {
         }
       }
     } else {
+      const isValidEntry = word => !((category === "verbs" || category === "adjectives") && !word.endsWith("-"));
       const wordList = [definition.items, definition.additional || "", definition.more || ""].filter(Boolean).join(" ");
-      for (const word of wordList.trim().split(/\s+/u)) {
-        entries.push({ word, group: "" });
+      const baseEntries = wordList.trim().split(/\s+/u)
+        .filter(word => word && isValidEntry(word))
+        .map(word => ({ word, group: "" }));
+      const existingWords = new Set(baseEntries.map(entry => entry.word));
+      const dailyEntries = [];
+      for (const word of (definition.daily || "").trim().split(/\s+/u)) {
+        if (word && isValidEntry(word) && !existingWords.has(word)) {
+          existingWords.add(word);
+          dailyEntries.push({ word, group: "" });
+          if (dailyEntries.length === 300) break;
+        }
       }
+      entries.push(...dailyEntries, ...baseEntries);
     }
     const seen = new Set();
     const uniqueEntries = entries.filter(entry => {
@@ -743,7 +913,7 @@ function normalizeVocabulary() {
     });
     normalized[category] = {
       label: definition.label,
-      entries: uniqueEntries.slice(0, 500),
+      entries: uniqueEntries.slice(0, 800),
     };
   }
   return normalized;
@@ -803,3 +973,4 @@ renderDocuments();
 checkBrowserReadiness();
 renderVocabulary();
 makeMessage("assistant", "안녕하세요! 저는 지금 저장된 자료를 검색해 근거와 함께 답하는 초기 프로토타입이에요. 아직 생성형 AI 모델은 연결되어 있지 않으니, 답을 자료에서 찾지 못하면 모른다고 말씀드릴게요.");
+initializeSavedTransformer();
