@@ -6,6 +6,9 @@ dist/
 build/
 coverage/
 
+# Keep raw model weights local; commit the compressed bundle instead.
+weights.json
+
 # Local environment and secrets
 .env
 .env.*
@@ -27,4 +30,3 @@ Desktop.ini
 .idea/
 *.swp
 *.swo
-

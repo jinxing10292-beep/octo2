@@ -587,28 +587,40 @@ async function initializeSavedTransformer() {
   }
 
   try {
-    const response = await fetch("./weights.json", { cache: "no-cache" });
-    if (!response.ok) throw new Error(`weights.json을 읽지 못했습니다 (HTTP ${response.status}).`);
+    const response = await fetch("./weights.json.gz", { cache: "no-cache" });
+    if (!response.ok) throw new Error(`압축 가중치 파일을 읽지 못했습니다 (HTTP ${response.status}).`);
     const contentLength = Number(response.headers.get("content-length"));
     if (Number.isFinite(contentLength) && contentLength > MAX_WEIGHTS_FILE_BYTES) {
-      throw new Error("배포된 weights.json이 256 MiB 제한을 넘었습니다.");
+      throw new Error("배포된 weights.json.gz가 256 MiB 제한을 넘었습니다.");
     }
-    const json = await response.text();
+    const responseBytes = await response.arrayBuffer();
+    const bytes = new Uint8Array(responseBytes);
+    const isGzip = bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
+    let json;
+    if (isGzip) {
+      if (typeof DecompressionStream !== "function") {
+        throw new Error("이 브라우저는 gzip 가중치 압축 해제를 지원하지 않습니다.");
+      }
+      const decompressed = new Blob([responseBytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+      json = await new Response(decompressed).text();
+    } else {
+      json = new TextDecoder().decode(responseBytes);
+    }
     const model = await readWeightsPackage(json);
-    const addedTokens = setTransformerModel(model, "weights.json 불러옴");
+    const addedTokens = setTransformerModel(model, "압축 가중치 불러옴");
     const checkpointSaved = addedTokens ? await saveTrainingCheckpoint(false) : false;
     status.textContent = addedTokens
       ? `${addedTokens}개 기본 토큰을 보충했습니다. 기존 학습값은 보존했으며 새 토큰은 기존 문자 가중치로 초기화하고, 없는 문자는 무작위 초기화해 관련 문장으로 학습해야 합니다.`
-      : "배포된 weights.json을 불러왔습니다. 훈련을 시작하면 기존 가중치에서 이어 학습합니다.";
+      : "배포된 압축 가중치를 불러왔습니다. 훈련을 시작하면 기존 가중치에서 이어 학습합니다.";
     if (!addedTokens) {
-      setWeightsSaveStatus("배포된 weights.json을 불러왔습니다. 훈련 체크포인트는 이 브라우저에 자동 저장됩니다.");
+      setWeightsSaveStatus("배포된 압축 가중치를 불러왔습니다. 훈련 체크포인트는 이 브라우저에 자동 저장됩니다.");
     } else if (checkpointSaved) {
       setWeightsSaveStatus("기존 학습 가중치를 보존하고 기본 어휘를 추가한 체크포인트를 저장했습니다. 새 토큰은 아직 학습되지 않았으므로 훈련 후 가중치 JSON을 내려받으세요.");
     }
   } catch (error) {
-    console.error("Could not load bundled weights.json.", error);
+    console.error("Could not load bundled compressed weights.", error);
     status.textContent = "기존 가중치를 불러오지 못했습니다. JSON 파일을 선택하거나 무작위 모델을 초기화하세요.";
-    setWeightsSaveStatus(`weights.json 자동 불러오기 실패: ${error.message || "모델을 검증하지 못했습니다."}`);
+    setWeightsSaveStatus(`압축 가중치 자동 불러오기 실패: ${error.message || "모델을 검증하지 못했습니다."}`);
   }
   setTransformerTrainingControls(false);
 }
