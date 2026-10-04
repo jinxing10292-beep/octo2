@@ -1170,7 +1170,14 @@ transformerReady = initializeSavedTransformer();
 
 // ===== 자동 훈련 시스템 =====
 
-const BACKEND_URL = "http://localhost:5000";
+// ===== 사용자 정의 한국어 문장 데이터베이스 =====
+const userTrainingCorpus = [
+  // 여기에 한국어 문장을 추가하세요
+  // 예시:
+  // "안녕하세요. 반갑습니다.",
+  // "오늘 날씨가 정말 좋네요.",
+];
+
 const autoTrainer = {
   isRunning: false,
   isPaused: false,
@@ -1181,6 +1188,12 @@ const autoTrainer = {
   async start() {
     if (!transformerModel) {
       showToast("먼저 모델을 초기화하거나 훈련하세요.");
+      return;
+    }
+    
+    // 사용자 문장 데이터 확인
+    if (userTrainingCorpus.length === 0) {
+      showToast("먼저 한국어 문장을 추가하세요. (자동 훈련 설정 참고)");
       return;
     }
     
@@ -1200,12 +1213,8 @@ const autoTrainer = {
       }
       
       try {
-        // 백엔드에서 문장 받아오기
-        const response = await fetch(`${BACKEND_URL}/api/sentence`);
-        if (!response.ok) throw new Error("백엔드 연결 실패");
-        
-        const data = await response.json();
-        const sentence = data.sentence;
+        // 사용자 데이터에서 랜덤 문장 선택
+        const sentence = userTrainingCorpus[Math.floor(Math.random() * userTrainingCorpus.length)];
         
         // 훈련
         const loss = window.OCTO_MINI_GPT.trainStep(transformerModel, sentence, 512);
@@ -1355,11 +1364,28 @@ function initAutoTrainerUI() {
   // 자동 훈련 섹션 HTML
   const autoTrainerHTML = `
     <div style="margin-top: 30px; padding: 15px; border-top: 2px solid #eee;">
-      <h3 style="margin: 0 0 15px 0; font-size: 16px; color: #333;">🤖 자동 훈련 (실험)</h3>
+      <h3 style="margin: 0 0 15px 0; font-size: 16px; color: #333;">🤖 자동 훈련</h3>
       
       <div style="display: grid; gap: 10px;">
         <div>
-          <label for="auto-training-steps" style="font-size: 13px; color: #666;">훈련 단계:</label>
+          <label style="font-size: 13px; color: #666; font-weight: bold;">📝 한국어 문장 추가</label>
+          <textarea 
+            id="auto-training-corpus"
+            placeholder="한국어 문장을 입력하세요. 한 문장씩 줄바꿈으로 구분합니다.&#10;예시:&#10;안녕하세요. 반갑습니다.&#10;오늘 날씨가 정말 좋네요.&#10;한국어를 공부합니다."
+            style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; font-family: monospace; font-size: 12px; height: 100px; resize: vertical;"
+          ></textarea>
+          <button 
+            onclick="addCorpusFromTextarea()"
+            type="button"
+            style="width: 100%; padding: 8px; margin-top: 8px; background: #6c757d; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;"
+          >✅ 문장 추가</button>
+          <p style="font-size: 12px; color: #999; margin: 8px 0 0 0;" id="corpus-count">
+            추가된 문장: 0개
+          </p>
+        </div>
+        
+        <div>
+          <label for="auto-training-steps" style="font-size: 13px; color: #666; font-weight: bold;">⚙️ 훈련 단계:</label>
           <input 
             type="number" 
             id="auto-training-steps" 
@@ -1420,39 +1446,44 @@ function initAutoTrainerUI() {
           >📋 JSON 복사</button>
         </div>
       </div>
-      
-      <p style="font-size: 12px; color: #999; margin: 15px 0 0 0;">
-        💡 백엔드 연결 상태: <span id="backend-status">확인 중...</span>
-      </p>
     </div>
   `;
   
   // HTML 추가
   trainingPanel.insertAdjacentHTML('beforeend', autoTrainerHTML);
-  
-  // 백엔드 상태 확인
-  checkBackendStatus();
 }
 
-async function checkBackendStatus() {
-  try {
-    const response = await fetch(`${BACKEND_URL}/api/health`);
-    const statusSpan = document.querySelector("#backend-status");
-    if (statusSpan) {
-      statusSpan.textContent = response.ok ? "✅ 연결됨" : "❌ 오류";
-      statusSpan.style.color = response.ok ? "#28a745" : "#dc3545";
-    }
-  } catch (error) {
-    const statusSpan = document.querySelector("#backend-status");
-    if (statusSpan) {
-      statusSpan.textContent = "❌ 연결 실패 (백엔드 시작 필요)";
-      statusSpan.style.color = "#dc3545";
-    }
+function addCorpusFromTextarea() {
+  const textarea = document.querySelector("#auto-training-corpus");
+  if (!textarea) return;
+  
+  const text = textarea.value.trim();
+  if (!text) {
+    showToast("문장을 입력하세요.");
+    return;
   }
+  
+  // 줄바꿈으로 문장 분리
+  const sentences = text.split('\n')
+    .map(s => s.trim())
+    .filter(s => s.length > 0);
+  
+  // 기존 데이터에 추가
+  userTrainingCorpus.push(...sentences);
+  
+  // UI 업데이트
+  const countSpan = document.querySelector("#corpus-count");
+  if (countSpan) {
+    countSpan.textContent = `추가된 문장: ${userTrainingCorpus.length}개`;
+  }
+  
+  // 텍스트 초기화
+  textarea.value = '';
+  
+  showToast(`${sentences.length}개 문장이 추가되었습니다. (총 ${userTrainingCorpus.length}개)`);
 }
 
 // 페이지 로드 시 자동 훈련 UI 초기화
 window.addEventListener('load', () => {
   setTimeout(initAutoTrainerUI, 500);
-  setInterval(checkBackendStatus, 30000); // 30초마다 상태 확인
 });
