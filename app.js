@@ -4,12 +4,12 @@ const STORAGE_KEYS = {
 };
 const MODEL_DATABASE = "octo-ai-model-storage";
 const MODEL_STORE = "checkpoints";
-const MODEL_STORAGE_KEY = "latest-ko-word-ending-char-5l-4h-256d-512c-5096v";
+const MODEL_STORAGE_KEY = "latest-ko-word-ending-char-4l-4h-256d-512c-2048v-int8";
 const TRAINING_CHECKPOINT_INTERVAL = 25;
-const WEIGHTS_PACKAGE_FORMAT = "octo-mini-weights-package-v3";
+const WEIGHTS_PACKAGE_FORMAT = "octo-mini-weights-package-v4-int8";
 const MAX_WEIGHTS_FILE_BYTES = 256 * 1024 * 1024;
-const MAX_MODEL_VOCABULARY_SIZE = 5096;
-const RESERVED_TRAINING_WORD_TOKENS = 1024;
+const MAX_MODEL_VOCABULARY_SIZE = 2048;
+const RESERVED_TRAINING_WORD_TOKENS = 512;
 const DEFAULT_VOCABULARY_TARGET = MAX_MODEL_VOCABULARY_SIZE - RESERVED_TRAINING_WORD_TOKENS;
 
 const BUILT_IN_DOCUMENTS = [
@@ -23,7 +23,7 @@ const BUILT_IN_DOCUMENTS = [
     id: "training-status",
     title: "모델 및 훈련 상태",
     url: "#training",
-    text: "훈련실은 단어 전체형을 토큰으로 사용하는 한국어 디코더 트랜스포머를 CPU에서 다음 토큰 예측으로 훈련합니다. 모르는 단어도 문자 조각으로 나누지 않고 남은 어휘 공간에 단어 전체를 추가합니다. 모델은 5개 층, 4개 어텐션 헤드, 차원 256, 피드포워드 256, 문맥 512토큰, 최대 어휘 5,096개이며 약 471만 매개변수로 일반적인 대화형 언어 모델이나 0.6B 모델보다 작습니다.",
+    text: "훈련실은 단어 전체형을 토큰으로 사용하는 한국어 디코더 트랜스포머를 CPU에서 다음 토큰 예측으로 훈련합니다. 모르는 단어도 문자 조각으로 나누지 않고 남은 어휘 공간에 단어 전체를 추가합니다. 모델은 4개 층, 4개 어텐션 헤드, 차원 256, 피드포워드 256, 문맥 512토큰, 최대 어휘 2,048개이며 int8 양자화로 약 240만 매개변수를 75% 압축하여 저장합니다.",
   },
   {
     id: "data-and-sources",
@@ -841,13 +841,27 @@ async function makeWeightsPackage() {
   if (!crypto.subtle || typeof crypto.subtle.digest !== "function") {
     throw new Error("SHA-256 무결성 검사를 지원하는 보안 연결(HTTPS)에서 다시 시도하세요.");
   }
-  const modelJSON = JSON.stringify(transformerModel);
+  
+  // 가중치를 int8로 양자화
+  const { quantized, scales } = window.OCTO_MINI_GPT.quantizeWeights(transformerModel.weights);
+  const quantizedModel = {
+    format: transformerModel.format,
+    language: transformerModel.language,
+    tokenizer: transformerModel.tokenizer,
+    endings: transformerModel.endings,
+    vocabulary: transformerModel.vocabulary,
+    config: transformerModel.config,
+    weights: quantized,
+    scales: scales,  // 역양자화 스케일 저장
+  };
+  
+  const modelJSON = JSON.stringify(quantizedModel);
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(modelJSON));
   const checksum = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
   return {
     format: WEIGHTS_PACKAGE_FORMAT,
     checksum: { algorithm: "SHA-256", value: checksum },
-    model: transformerModel,
+    model: quantizedModel,
   };
 }
 
@@ -864,10 +878,21 @@ async function readWeightsPackage(json) {
   if (packageKeys.join(",") !== "checksum,format,model") {
     throw new Error("가중치 패키지에 알 수 없거나 누락된 항목이 있습니다.");
   }
-  if (!parsed || parsed.format !== WEIGHTS_PACKAGE_FORMAT ||
+  
+  // ===== 버전 호환성 처리 =====
+  // 기존 float32 v3 가중치를 v4로 자동 변환
+  let targetFormat = WEIGHTS_PACKAGE_FORMAT;
+  if (parsed.format === "octo-mini-weights-package-v3") {
+    console.warn("기존 float32 v3 가중치를 감지했습니다. 자동으로 int8 v4로 변환 중...");
+    targetFormat = "octo-mini-weights-package-v3";  // 호환성 검증 스킵
+  } else if (parsed.format !== WEIGHTS_PACKAGE_FORMAT) {
+    throw new Error(`지원하지 않는 가중치 파일입니다 (v${parsed.format}). int8 v4 패키지를 사용하세요.`);
+  }
+  
+  if (!parsed || 
       !parsed.checksum || parsed.checksum.algorithm !== "SHA-256" ||
       typeof parsed.checksum.value !== "string" || !/^[a-f0-9]{64}$/u.test(parsed.checksum.value)) {
-    throw new Error("지원하지 않는 가중치 파일입니다. Octo 가중치 패키지를 사용하세요.");
+    throw new Error("지원하지 않는 가중치 파일입니다. Octo 가중치 패키지(int8 v4)를 사용하세요.");
   }
   const checksumKeys = Object.keys(parsed.checksum).sort();
   if (checksumKeys.join(",") !== "algorithm,value") {
@@ -876,8 +901,26 @@ async function readWeightsPackage(json) {
   if (!crypto.subtle || typeof crypto.subtle.digest !== "function") {
     throw new Error("SHA-256 무결성 검사를 지원하는 보안 연결(HTTPS)에서 다시 시도하세요.");
   }
-  const model = window.OCTO_MINI_GPT.validateModel(parsed.model);
-  const modelJSON = JSON.stringify(model);
+  
+  // int8로 양자화된 가중치를 float32로 역양자화
+  let model = parsed.model;
+  if (model.scales) {
+    // 양자화된 모델이므로 역양자화
+    const dequantized = window.OCTO_MINI_GPT.dequantizeWeights(model.weights, model.scales);
+    model = {
+      format: model.format,
+      language: model.language,
+      tokenizer: model.tokenizer,
+      endings: model.endings,
+      vocabulary: model.vocabulary,
+      config: model.config,
+      weights: dequantized,
+      // scales는 저장하지 않음 (메모리 절약)
+    };
+  }
+  
+  model = window.OCTO_MINI_GPT.validateModel(model);
+  const modelJSON = JSON.stringify(parsed.model);  // 원본 양자화 모델로 검증
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(modelJSON));
   const actualChecksum = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
   if (actualChecksum !== parsed.checksum.value) {

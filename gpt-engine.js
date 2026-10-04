@@ -1,16 +1,18 @@
 (function () {
   "use strict";
 
-  const FORMAT = "octo-mini-decoder-v4";
+  const FORMAT = "octo-mini-decoder-v5-quantized";
   const TOKENIZER = "ko-word-ending-char-v1";
   const MODEL_DIMENSION = 256;
   const ATTENTION_HEADS = 4;
   const HEAD_DIMENSION = MODEL_DIMENSION / ATTENTION_HEADS;
   const FEED_FORWARD_DIMENSION = 256;
-  const TRANSFORMER_LAYERS = 5;
+  const TRANSFORMER_LAYERS = 4;
   const CONTEXT_LENGTH = 512;
-  const MAX_VOCABULARY_SIZE = 5096;
+  const MAX_VOCABULARY_SIZE = 2048;
   const MAX_CHARACTER_TOKENS = 1536;
+  const QUANTIZATION_ENABLED = true;
+  const QUANTIZATION_BITS = 8;
   const WORD_PATTERN = /[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu;
   const validatedModels = new WeakSet();
 
@@ -49,6 +51,169 @@
     const exponents = values.map(value => Math.exp(Math.max(-40, (value - maximum) / temperature)));
     const total = exponents.reduce((sum, value) => sum + value, 0);
     return exponents.map(value => value / total);
+  }
+
+  // ===== 양자화 함수 (int8) =====
+  
+  function findScale(matrix) {
+    // 행렬의 절댓값 최댓값 찾기
+    let maximum = 0;
+    for (const row of matrix) {
+      for (const value of row) {
+        maximum = Math.max(maximum, Math.abs(value));
+      }
+    }
+    // 스케일 계산: int8 범위 [-128, 127]
+    return maximum === 0 ? 1 : maximum / 127;
+  }
+
+  function findScaleVector(vector) {
+    // 벡터의 절댓값 최댓값 찾기
+    let maximum = 0;
+    for (const value of vector) {
+      maximum = Math.max(maximum, Math.abs(value));
+    }
+    return maximum === 0 ? 1 : maximum / 127;
+  }
+
+  function quantizeMatrix(matrix) {
+    // float32 행렬을 int8로 양자화
+    const scale = findScale(matrix);
+    const quantized = matrix.map(row =>
+      row.map(value => Math.round(Math.max(-128, Math.min(127, value / scale))))
+    );
+    return { quantized, scale };
+  }
+
+  function quantizeVector(vector) {
+    // float32 벡터를 int8로 양자화
+    const scale = findScaleVector(vector);
+    const quantized = vector.map(value =>
+      Math.round(Math.max(-128, Math.min(127, value / scale)))
+    );
+    return { quantized, scale };
+  }
+
+  function dequantizeMatrix(quantized, scale) {
+    // int8 행렬을 float32로 역양자화
+    return quantized.map(row => row.map(value => value * scale));
+  }
+
+  function dequantizeVector(quantized, scale) {
+    // int8 벡터를 float32로 역양자화
+    return quantized.map(value => value * scale);
+  }
+
+  function quantizeWeights(weights) {
+    // 모든 가중치를 양자화하고 스케일 저장
+    const quantized = {
+      tokenEmbedding: null,
+      positionEmbedding: null,
+      layers: [],
+      languageHead: null,
+      languageHeadBias: null,
+    };
+    const scales = {
+      tokenEmbedding: 0,
+      positionEmbedding: 0,
+      layers: [],
+      languageHead: 0,
+      languageHeadBias: 0,
+    };
+
+    // 임베딩 양자화
+    const tokenEmb = quantizeMatrix(weights.tokenEmbedding);
+    quantized.tokenEmbedding = tokenEmb.quantized;
+    scales.tokenEmbedding = tokenEmb.scale;
+
+    const posEmb = quantizeMatrix(weights.positionEmbedding);
+    quantized.positionEmbedding = posEmb.quantized;
+    scales.positionEmbedding = posEmb.scale;
+
+    // 레이어별 양자화
+    for (const layer of weights.layers) {
+      const quantLayer = {};
+      const scaleLayer = {};
+
+      for (const name of ["query", "key", "value", "attentionOutput", "feedForwardOut"]) {
+        const q = quantizeMatrix(layer[name]);
+        quantLayer[name] = q.quantized;
+        scaleLayer[name] = q.scale;
+      }
+
+      for (const name of ["feedForwardIn"]) {
+        const q = quantizeMatrix(layer[name]);
+        quantLayer[name] = q.quantized;
+        scaleLayer[name] = q.scale;
+      }
+
+      for (const name of ["feedForwardInBias", "feedForwardOutBias"]) {
+        const q = quantizeVector(layer[name]);
+        quantLayer[name] = q.quantized;
+        scaleLayer[name] = q.scale;
+      }
+
+      quantized.layers.push(quantLayer);
+      scales.layers.push(scaleLayer);
+    }
+
+    // 언어 헤드 양자화
+    const langHead = quantizeMatrix(weights.languageHead);
+    quantized.languageHead = langHead.quantized;
+    scales.languageHead = langHead.scale;
+
+    const langHeadBias = quantizeVector(weights.languageHeadBias);
+    quantized.languageHeadBias = langHeadBias.quantized;
+    scales.languageHeadBias = langHeadBias.scale;
+
+    return { quantized, scales };
+  }
+
+  function dequantizeWeights(quantized, scales) {
+    // 모든 가중치를 역양자화
+    const dequantized = {
+      tokenEmbedding: null,
+      positionEmbedding: null,
+      layers: [],
+      languageHead: null,
+      languageHeadBias: null,
+    };
+
+    dequantized.tokenEmbedding = dequantizeMatrix(
+      quantized.tokenEmbedding,
+      scales.tokenEmbedding
+    );
+    dequantized.positionEmbedding = dequantizeMatrix(
+      quantized.positionEmbedding,
+      scales.positionEmbedding
+    );
+
+    for (let i = 0; i < quantized.layers.length; i += 1) {
+      const quantLayer = quantized.layers[i];
+      const scaleLayer = scales.layers[i];
+      const dequantLayer = {};
+
+      for (const name of ["query", "key", "value", "attentionOutput", "feedForwardOut", "feedForwardIn"]) {
+        dequantLayer[name] = dequantizeMatrix(quantLayer[name], scaleLayer[name]);
+      }
+
+      for (const name of ["feedForwardInBias", "feedForwardOutBias"]) {
+        dequantLayer[name] = dequantizeVector(quantLayer[name], scaleLayer[name]);
+      }
+
+      dequantized.layers.push(dequantLayer);
+    }
+
+    dequantized.languageHead = dequantizeMatrix(
+      quantized.languageHead,
+      scales.languageHead
+    );
+    dequantized.languageHeadBias = dequantizeVector(
+      quantized.languageHeadBias,
+      scales.languageHeadBias
+    );
+
+    return dequantized;
   }
 
   function getRegisteredEndings() {
@@ -226,7 +391,7 @@
 
   function validateModel(model) {
     if (!model || model.format !== FORMAT || model.language !== "ko") {
-      throw new Error("지원하지 않는 가중치 형식입니다. 현재 5층 혼합 토큰 모델의 가중치 JSON인지 확인하세요.");
+      throw new Error("지원하지 않는 가중치 형식입니다. 현재 4층 혼합 토큰 모델(int8 양자화)의 가중치 JSON인지 확인하세요.");
     }
     validateExactKeys(model, ["format", "language", "tokenizer", "endings", "vocabulary", "config", "weights"], "모델");
     if (!Array.isArray(model.vocabulary) || model.vocabulary.length < 2 ||
@@ -257,7 +422,7 @@
         config.context !== CONTEXT_LENGTH || config.maxVocabulary !== MAX_VOCABULARY_SIZE ||
         config.layers !== TRANSFORMER_LAYERS || config.heads !== ATTENTION_HEADS ||
         config.objective !== "next-token-prediction" || model.tokenizer !== TOKENIZER) {
-      throw new Error("가중치의 모델 설정이 현재 5층·4헤드 구조와 일치하지 않습니다.");
+      throw new Error("가중치의 모델 설정이 현재 4층·4헤드 구조와 일치하지 않습니다.");
     }
     validateExactKeys(weights, ["tokenEmbedding", "positionEmbedding", "layers", "languageHead", "languageHeadBias"], "모델 가중치");
 
@@ -641,5 +806,7 @@
     generate,
     generateContinuation,
     tokenize: tokenizeText,
+    quantizeWeights,
+    dequantizeWeights,
   });
 })();
