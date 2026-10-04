@@ -17,7 +17,7 @@ const BUILT_IN_DOCUMENTS = [
     id: "prototype-overview",
     title: "프로토타입 안내",
     url: "#prototype",
-    text: "이 프로토타입은 한국어로 질문을 입력하면 브라우저에 준비된 자료와 사용자가 추가한 자료에서 관련 내용을 검색합니다. 검색된 자료의 문장을 근거로 보여주며, 관련 자료가 없으면 모른다고 답합니다. 현재 생성형 언어 모델은 연결되어 있지 않아 자유로운 문장 생성이나 일반 지식 답변은 제공하지 않습니다.",
+    text: "채팅은 저장된 자료에서 근거를 찾아 출처와 함께 답하거나, 자료와 관련이 없는 일상 대화에는 브라우저에 불러온 한국어 미니 언어 모델을 사용합니다. 대화 모델은 규모가 작아 답변이 부정확할 수 있습니다.",
   },
   {
     id: "training-status",
@@ -29,7 +29,7 @@ const BUILT_IN_DOCUMENTS = [
     id: "data-and-sources",
     title: "자료 및 출처 사용",
     url: "#sources",
-    text: "채팅 화면의 검색 답변은 저장된 자료에서 찾은 내용에만 근거합니다. 자료를 찾지 못하거나 질문과 자료의 관련성이 낮으면 추측하지 않고 모른다고 답합니다. 별도 훈련실의 미니 언어 모델은 자료 검색 답변과 구분된 단어·어미·문자 혼합 토큰의 다음 토큰 예측 실험이며, 일반적인 질의응답 능력을 보장하지 않습니다.",
+    text: "자동 모드에서 저장된 자료와 질문이 직접 일치하면 검색된 문장을 근거로 답하고 출처를 표시합니다. 직접적인 근거가 없으면 브라우저의 미니 언어 모델로 일상 대화를 생성합니다. 자료 검색 모드에서는 근거가 없을 때 모른다고 답합니다. 미니 모델은 작아 일반 지식이나 정확한 답변을 보장하지 않습니다.",
   },
 ];
 
@@ -44,8 +44,11 @@ const datasetEmpty = document.querySelector("#dataset-empty");
 const toast = document.querySelector("#toast");
 let toastTimer;
 let transformerModel = null;
+let transformerReady = Promise.resolve();
 let cancelTransformerTraining = false;
 let weightsFileHandle = null;
+const chatHistory = [];
+const sendChatButton = document.querySelector("#chat-form button[type='submit']");
 
 function readStoredArray(key) {
   try {
@@ -80,7 +83,7 @@ function createId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-function makeMessage(role, text, sources = []) {
+function makeMessage(role, text, sources = [], answerType = sources.length ? "search" : "conversation") {
   const article = document.createElement("article");
   article.className = `message ${role}`;
 
@@ -96,7 +99,13 @@ function makeMessage(role, text, sources = []) {
   body.className = "message-body";
   const label = document.createElement("p");
   label.className = "message-label";
-  label.textContent = role === "assistant" ? "Octo · 검색 기반 답변" : "나";
+  label.textContent = role !== "assistant"
+    ? "나"
+    : answerType === "search"
+      ? "Octo · 자료 검색"
+      : answerType === "conversation"
+        ? "Octo · 로컬 미니 모델"
+        : "Octo";
   const content = document.createElement("p");
   content.className = "message-text";
   content.textContent = text;
@@ -130,7 +139,12 @@ function makeMessage(role, text, sources = []) {
   if (role === "assistant") {
     const note = document.createElement("span");
     note.className = "answer-note";
-    note.textContent = "검색된 자료를 바탕으로 한 프로토타입 응답";
+    note.textContent = answerType === "search"
+      ? "저장된 자료에서 찾은 근거"
+      : answerType === "conversation"
+        ? "작은 로컬 모델의 생성 답변으로 틀릴 수 있습니다"
+        : "";
+    note.hidden = !note.textContent;
     body.append(note);
   }
 
@@ -219,15 +233,67 @@ function answerFromSources(query, sources) {
   return { text: excerpts.join("\n\n"), sources: citedSources };
 }
 
-function submitQuestion(question) {
+function hasDirectSearchMatch(query, sources) {
+  const exactTerms = normalizeText(query).split(" ").filter(term => term.length > 1);
+  return exactTerms.some(term => sources.some(source =>
+    textTerms(`${source.title} ${source.text}`).has(term),
+  ));
+}
+
+function createConversationPrompt(question) {
+  const previousTurns = chatHistory.slice(-6).map(turn =>
+    `사용자: ${turn.question}\n답변: ${turn.answer}`,
+  );
+  return [...previousTurns, `사용자: ${question}\n답변:`].join("\n");
+}
+
+async function submitQuestion(question) {
   const trimmed = question.trim();
-  if (!trimmed) return;
+  if (!trimmed || sendChatButton.disabled) return;
   makeMessage("user", trimmed);
   chatInput.value = "";
   chatInput.style.height = "auto";
+  sendChatButton.disabled = true;
 
-  const result = answerFromSources(trimmed, searchDocuments(trimmed));
-  makeMessage("assistant", result.text, result.sources);
+  try {
+    const mode = document.querySelector("#chat-mode").value;
+    const sources = searchDocuments(trimmed);
+    if (mode === "search" || (mode === "auto" && hasDirectSearchMatch(trimmed, sources))) {
+      const result = answerFromSources(trimmed, sources);
+      makeMessage("assistant", result.text, result.sources, "search");
+      chatHistory.push({ question: trimmed, answer: result.text });
+      return;
+    }
+
+    await transformerReady;
+    if (!transformerModel) {
+      const message = "일상 대화를 생성할 미니 모델을 불러오지 못했습니다. 가중치 로드 상태를 확인하거나 자료 검색 모드로 질문해 주세요.";
+      makeMessage("assistant", message, [], "system");
+      chatHistory.push({ question: trimmed, answer: message });
+      return;
+    }
+
+    if (!window.OCTO_MINI_GPT.tokenize(transformerModel, trimmed).segments.flat().length) {
+      throw new Error("질문에 모델 어휘로 처리할 수 있는 단어가 없습니다. 자료 검색 모드로 바꾸거나 모델 어휘에 맞는 표현을 사용해 주세요.");
+    }
+    await new Promise(resolve => window.setTimeout(resolve, 0));
+    const response = window.OCTO_MINI_GPT.generateContinuation(
+      transformerModel,
+      createConversationPrompt(trimmed),
+      24,
+      0.65,
+    ).trim();
+    if (!response) throw new Error("모델이 답변 토큰을 생성하지 못했습니다.");
+    makeMessage("assistant", response, [], "conversation");
+    chatHistory.push({ question: trimmed, answer: response });
+  } catch (error) {
+    console.error("Could not answer the chat message.", error);
+    const message = `답변을 만들지 못했습니다: ${error.message || "알 수 없는 오류"}`;
+    makeMessage("assistant", message, [], "system");
+    chatHistory.push({ question: trimmed, answer: message });
+  } finally {
+    sendChatButton.disabled = false;
+  }
 }
 
 chatForm.addEventListener("submit", event => {
@@ -253,6 +319,7 @@ document.querySelectorAll(".suggestion").forEach(button => {
 
 document.querySelector("#clear-chat").addEventListener("click", () => {
   conversation.replaceChildren();
+  chatHistory.length = 0;
   showToast("대화를 지웠습니다.");
 });
 
@@ -1054,5 +1121,5 @@ renderExamples();
 renderDocuments();
 checkBrowserReadiness();
 renderVocabulary();
-makeMessage("assistant", "안녕하세요! 저는 지금 저장된 자료를 검색해 근거와 함께 답하는 초기 프로토타입이에요. 아직 생성형 AI 모델은 연결되어 있지 않으니, 답을 자료에서 찾지 못하면 모른다고 말씀드릴게요.");
-initializeSavedTransformer();
+makeMessage("assistant", "안녕하세요! 자동 모드에서는 저장된 자료에 직접적인 근거가 있을 때 출처와 함께 답하고, 그 외의 일상 대화는 로컬 미니 모델로 생성해요. 모델이 작아 답변이 부정확할 수 있습니다.", [], "system");
+transformerReady = initializeSavedTransformer();

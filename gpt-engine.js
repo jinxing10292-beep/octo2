@@ -588,11 +588,12 @@
     return backpropagate(model, cache, targets);
   }
 
-  function generate(model, prompt, maximumTokens = 40, temperature = 0.8) {
+  function generateTokenIds(model, prompt, maximumTokens, temperature) {
     validateModel(model);
     const encodedPrompt = tokenizeText(model, prompt);
     const result = encodedPrompt.segments.flat();
-    if (!result.length) result.push(Math.floor(Math.random() * model.vocabulary.length));
+    if (!result.length) throw new Error("시작 문구에 모델 어휘로 처리할 수 있는 토큰이 없습니다.");
+    const promptLength = result.length;
 
     for (let step = 0; step < maximumTokens; step += 1) {
       const context = result.slice(-model.config.context);
@@ -609,7 +610,17 @@
       }
       result.push(nextToken);
     }
+    return { result, promptLength };
+  }
+
+  function generate(model, prompt, maximumTokens = 40, temperature = 0.8) {
+    const { result } = generateTokenIds(model, prompt, maximumTokens, temperature);
     return result.map(id => model.vocabulary[id]).join("");
+  }
+
+  function generateContinuation(model, prompt, maximumTokens = 24, temperature = 0.65) {
+    const { result, promptLength } = generateTokenIds(model, prompt, maximumTokens, temperature);
+    return result.slice(promptLength).map(id => model.vocabulary[id]).join("");
   }
 
   window.OCTO_MINI_GPT = Object.freeze({
@@ -628,6 +639,7 @@
     validateModel,
     trainStep,
     generate,
+    generateContinuation,
     tokenize: tokenizeText,
   });
 })();

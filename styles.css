@@ -148,6 +148,7 @@ h1, h2, p { margin-top: 0; }
 .citation:hover { border-color: #c9c2ff; color: var(--purple); }
 .citation-number { color: var(--purple); font-weight: 700; }
 .answer-note { display: block; margin-top: 9px; color: #a0a2ae; font-size: 10px; }
+.answer-note[hidden] { display: none; }
 .composer-area { margin-top: auto; }
 .suggestions { display: flex; justify-content: center; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
 .suggestion { padding: 7px 11px; border: 1px solid #e7e7ef; border-radius: 20px; color: #7c8091; background: rgba(255,255,255,.8); font-size: 10px; cursor: pointer; transition: .15s; }
@@ -156,9 +157,11 @@ h1, h2, p { margin-top: 0; }
 .composer:focus-within { border-color: #c8c0ff; box-shadow: 0 5px 24px rgba(83, 68, 200, .08); }
 .composer textarea { display: block; width: 100%; min-height: 30px; max-height: 150px; resize: none; border: 0; outline: 0; color: var(--ink); background: transparent; font-size: 12px; line-height: 1.6; }
 .composer textarea::placeholder, .dataset-form textarea::placeholder { color: #b3b5c0; }
-.composer-bottom { display: flex; align-items: center; justify-content: space-between; padding-top: 6px; }
-.composer-hint { color: #a4a6b1; font-size: 9px; }
-.composer-hint span { margin-right: 4px; font-size: 13px; }
+.composer-bottom { display: flex; align-items: center; gap: 8px; padding-top: 6px; }
+.chat-mode-label { color: #a4a6b1; font-size: 9px; }
+.chat-mode { min-width: 0; max-width: 220px; height: 29px; margin-right: auto; padding: 0 7px; border: 1px solid #e9e9ef; border-radius: 6px; color: #777b8a; background: #fff; font: inherit; font-size: 9px; }
+.chat-mode:focus { border-color: #c8c0ff; outline: 0; }
+.send-button:disabled { cursor: wait; opacity: .65; }
 .send-button { display: inline-flex; align-items: center; gap: 8px; padding: 7px 10px; border: 0; border-radius: 7px; color: #fff; background: var(--purple); font-size: 10px; cursor: pointer; }
 .send-button:hover, .primary-button:hover { background: var(--purple-dark); }
 .send-button span:last-child { display: grid; width: 15px; height: 15px; place-items: center; border-radius: 4px; background: rgba(255,255,255,.19); font-size: 12px; }
