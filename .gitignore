@@ -6,8 +6,7 @@ dist/
 build/
 coverage/
 
-# Keep raw model weights local; commit the compressed bundle instead.
-weights.json
+# Model weights are now tracked (int8 quantized format)
 
 # Local environment and secrets
 .env
