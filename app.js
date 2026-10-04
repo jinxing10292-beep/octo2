@@ -1179,8 +1179,6 @@ const userTrainingCorpus = [
 ];
 
 // 모바일 감지
-const isMobile = () => /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
-
 const autoTrainer = {
   isRunning: false,
   isPaused: false,
@@ -1191,15 +1189,13 @@ const autoTrainer = {
   lastSaveStep: 0,
   sessionStartTime: 0,
   
-  // 모바일/데스크톱별 최적화 설정
+  // 간단한 설정
   getOptimizations() {
-    const mobile = isMobile();
     return {
-      isMobile: mobile,
-      delayBetweenSteps: mobile ? 25 : 0,        // 모바일: 25ms (이벤트 루프 유지), 데스크톱: 0ms
-      saveInterval: mobile ? 25 : 50,            // 모바일: 25단계마다 저장
-      maxLossesBuffer: mobile ? 5 : 25,          // 모바일: 메모리 극도로 절약 (5개만)
-      checkpointInterval: mobile ? 120000 : 300000,  // 모바일: 2분, 데스크톱: 5분
+      delayBetweenSteps: 0,        // 지연 없음 (빠름)
+      saveInterval: 25,            // 25단계마다 저장
+      maxLossesBuffer: 50,         // 최근 손실 50개 유지
+      checkpointInterval: 600000,  // 10분마다 체크포인트
     };
   },
   
@@ -1242,13 +1238,17 @@ const autoTrainer = {
   async runNextStep() {
     const opts = this.getOptimizations();
     
-    // 중지되었거나 완료됨
-    if (!this.isRunning || this.currentStep >= this.totalSteps) {
-      if (this.currentStep >= this.totalSteps) {
-        showToast("자동 훈련 완료!");
-        // 백그라운드에서 저장 (await 하지 않음)
-        saveTrainingCheckpoint(true).catch(err => console.error('Final save failed:', err));
-      }
+    // 중지됨
+    if (!this.isRunning) {
+      this.isRunning = false;
+      updateAutoTrainerUI();
+      return;
+    }
+    
+    // 완료됨
+    if (this.currentStep >= this.totalSteps) {
+      showToast("자동 훈련 완료!");
+      saveTrainingCheckpoint(true).catch(err => console.error('Final save failed:', err));
       this.isRunning = false;
       updateAutoTrainerUI();
       return;
@@ -1257,7 +1257,7 @@ const autoTrainer = {
     // 일시정지 중
     if (this.isPaused) {
       updateAutoTrainerUI();
-      this.trainingTimeoutId = setTimeout(() => this.runNextStep(), 500);
+      this.trainingTimeoutId = setTimeout(() => this.runNextStep(), 100);
       return;
     }
     
@@ -1269,20 +1269,19 @@ const autoTrainer = {
       const loss = window.OCTO_MINI_GPT.trainStep(transformerModel, sentence, 512);
       this.losses.push(loss);
       
-      // 손실 버퍼 관리 (메모리 절약)
+      // 손실 버퍼 관리
       if (this.losses.length > opts.maxLossesBuffer) {
         this.losses.shift();
       }
       
       this.currentStep += 1;
       
-      // 저장 실행 (비블로킹: await 하지 않음)
-      if (this.currentStep - this.lastSaveStep >= opts.saveInterval) {
+      // 저장 (25단계마다)
+      if (this.currentStep % opts.saveInterval === 0) {
         saveTrainingCheckpoint(false).catch(err => console.error('Auto-save failed:', err));
-        this.lastSaveStep = this.currentStep;
       }
       
-      // 정기적 체크포인트 (배터리 절약, 모바일 백그라운드 대비)
+      // 정기적 체크포인트 (10분마다)
       const elapsedTime = Date.now() - this.sessionStartTime;
       if (elapsedTime > opts.checkpointInterval) {
         saveTrainingCheckpoint(true).catch(err => console.error('Checkpoint save failed:', err));
@@ -1299,7 +1298,7 @@ const autoTrainer = {
       return;
     }
     
-    // 다음 단계 예약 (즉시 실행 - setTimeout(0) 사용)
+    // 다음 단계 예약
     this.trainingTimeoutId = setTimeout(() => this.runNextStep(), opts.delayBetweenSteps);
   },
   
@@ -1427,7 +1426,7 @@ function initAutoTrainerUI() {
   
   // 자동 훈련 섹션 HTML
   const autoTrainerHTML = `
-    <div style="margin-top: 30px; padding: 15px; border-top: 2px solid #eee;">
+    <div style="margin-top: 30px; padding: 15px; border-top: 2px solid #eee; background: #ffffff;">
       <h3 style="margin: 0 0 15px 0; font-size: 16px; color: #333;">🤖 자동 훈련</h3>
       
       <div style="display: grid; gap: 10px;">
@@ -1436,7 +1435,7 @@ function initAutoTrainerUI() {
           <textarea 
             id="auto-training-corpus"
             placeholder="한국어 문장을 입력하세요. 한 문장씩 줄바꿈으로 구분합니다.&#10;예시:&#10;안녕하세요. 반갑습니다.&#10;오늘 날씨가 정말 좋네요.&#10;한국어를 공부합니다."
-            style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; font-family: monospace; font-size: 12px; height: 100px; resize: vertical;"
+            style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; font-family: monospace; font-size: 12px; height: 100px; resize: vertical; background: #ffffff; color: #333;"
           ></textarea>
           <button 
             onclick="addCorpusFromTextarea()"
@@ -1456,7 +1455,7 @@ function initAutoTrainerUI() {
             value="100" 
             min="1" 
             max="10000"
-            style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box;"
+            style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; background: #ffffff; color: #333;"
           >
         </div>
         
@@ -1491,7 +1490,7 @@ function initAutoTrainerUI() {
           >0%</div>
         </div>
         
-        <div id="auto-training-status" style="font-size: 13px; color: #666; line-height: 1.5;">
+        <div id="auto-training-status" style="font-size: 13px; color: #666; line-height: 1.5; background: #f9f9f9; padding: 8px; border-radius: 4px;">
           준비됨
         </div>
         
@@ -1552,84 +1551,9 @@ window.addEventListener('load', () => {
   setTimeout(initAutoTrainerUI, 500);
 });
 
-// ===== 모바일 백그라운드 대응 =====
-let pageVisibility = document.visibilityState;
-
-document.addEventListener('visibilitychange', async () => {
-  const wasVisible = pageVisibility === 'visible';
-  pageVisibility = document.visibilityState;
-  const isNowVisible = pageVisibility === 'visible';
-  
-  if (wasVisible && !isNowVisible) {
-    // 백그라운드로 전환: 훈련 일시정지 + 즉시 저장
-    if (autoTrainer.isRunning && !autoTrainer.isPaused) {
-      console.log('[Auto-Trainer] 페이지가 백그라운드로 전환됨. 훈련 일시정지 및 즉시 저장.');
-      autoTrainer.pause();
-      // 즉시 저장 (매우 중요)
-      await saveTrainingCheckpoint(true);
-      showToast("⏸️ 백그라운드 전환: 훈련 일시정지 · 진행상황 저장됨");
-    }
-  } else if (!wasVisible && isNowVisible) {
-    // 포그라운드로 복귀
-    if (autoTrainer.isPaused) {
-      console.log('[Auto-Trainer] 페이지가 포그라운드로 복귀.');
-      showToast("✅ 포그라운드 복귀 · 재개 버튼으로 계속하세요");
-    }
-  }
-});
-
-// 페이지 언로드 시 훈련 중지 + 최종 저장 (베스트 에포트)
-window.addEventListener('beforeunload', (event) => {
+// ===== 페이지 언로드 시 최종 저장 =====
+window.addEventListener('beforeunload', () => {
   if (autoTrainer.isRunning) {
     autoTrainer.stop();
-    // 비동기이지만 베스트 에포트로 시도
-    navigator.sendBeacon?.('/', new Blob([JSON.stringify({action: 'save-checkpoint'})], {type: 'application/json'}));
   }
 });
-
-// ===== 온라인/오프라인 대응 =====
-window.addEventListener('offline', () => {
-  console.log('[Auto-Trainer] 오프라인 전환');
-  if (autoTrainer.isRunning && !autoTrainer.isPaused) {
-    autoTrainer.pause();
-    showToast("⚠️ 오프라인: 훈련 일시정지 (WiFi 재연결 후 재개 가능)");
-  }
-});
-
-window.addEventListener('online', () => {
-  console.log('[Auto-Trainer] 온라인 복귀');
-  showToast("✅ 온라인 복귀 · 훈련을 재개할 수 있습니다");
-});
-
-// ===== 배터리 절약 모드 감지 =====
-if ('getBattery' in navigator) {
-  navigator.getBattery?.().then(battery => {
-    const updateBatteryStatus = () => {
-      if (battery.level < 0.1 && autoTrainer.isRunning) {
-        autoTrainer.pause();
-        showToast("🔋 배터리 부족 (10% 이하): 훈련 일시정지");
-      }
-    };
-    battery.addEventListener('levelchange', updateBatteryStatus);
-  }).catch(() => {});
-}
-
-// ===== 메모리 경고 모니터링 (선택적) =====
-if ('memory' in performance) {
-  let lastWarning = 0;
-  setInterval(() => {
-    const memUsage = performance.memory;
-    if (memUsage && memUsage.usedJSHeapSize / memUsage.jsHeapSizeLimit > 0.9) {
-      const now = Date.now();
-      if (now - lastWarning > 5000) {
-        console.warn('[Auto-Trainer] 메모리 사용률 > 90%');
-        lastWarning = now;
-        if (autoTrainer.isRunning && !autoTrainer.isPaused) {
-          autoTrainer.pause();
-          showToast("⚠️ 메모리 부족: 훈련 일시정지 · 저장 중...");
-          saveTrainingCheckpoint(true).catch(err => console.error('Memory crisis save failed:', err));
-        }
-      }
-    }
-  }, 2000);
-}
