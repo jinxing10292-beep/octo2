@@ -1196,10 +1196,10 @@ const autoTrainer = {
     const mobile = isMobile();
     return {
       isMobile: mobile,
-      delayBetweenSteps: mobile ? 50 : 5,      // 모바일은 더 긴 지연
-      saveInterval: mobile ? 50 : 25,          // 모바일은 더 자주 저장
-      maxLossesBuffer: mobile ? 10 : 50,       // 모바일은 메모리 절약
-      checkpointInterval: mobile ? 300000 : 600000,  // 모바일: 5분, 데스크톱: 10분
+      delayBetweenSteps: mobile ? 25 : 0,        // 모바일: 25ms (이벤트 루프 유지), 데스크톱: 0ms
+      saveInterval: mobile ? 25 : 50,            // 모바일: 25단계마다 저장
+      maxLossesBuffer: mobile ? 5 : 25,          // 모바일: 메모리 극도로 절약 (5개만)
+      checkpointInterval: mobile ? 120000 : 300000,  // 모바일: 2분, 데스크톱: 5분
     };
   },
   
@@ -1215,16 +1215,25 @@ const autoTrainer = {
       return;
     }
     
+    // 이미 실행 중
+    if (this.isRunning) {
+      showToast("이미 훈련 중입니다.");
+      return;
+    }
+    
     this.isRunning = true;
     this.isPaused = false;
-    this.totalSteps = parseInt(document.querySelector("#auto-training-steps").value) || 100;
+    this.totalSteps = Math.max(1, Math.min(10000, parseInt(document.querySelector("#auto-training-steps").value) || 100));
     this.currentStep = 0;
     this.losses = [];
     this.lastSaveStep = 0;
     this.sessionStartTime = Date.now();
     
     updateAutoTrainerUI();
-    showToast("자동 훈련 시작...");
+    
+    const opts = this.getOptimizations();
+    const device = opts.isMobile ? "📱 모바일" : "💻 데스크톱";
+    showToast(`${device} 자동 훈련 시작 (${this.totalSteps}단계)...`);
     
     // 비동기 훈련 루프 (무한 루프 대신 개별 단계 실행)
     this.runNextStep();
@@ -1237,7 +1246,8 @@ const autoTrainer = {
     if (!this.isRunning || this.currentStep >= this.totalSteps) {
       if (this.currentStep >= this.totalSteps) {
         showToast("자동 훈련 완료!");
-        await saveTrainingCheckpoint(true);
+        // 백그라운드에서 저장 (await 하지 않음)
+        saveTrainingCheckpoint(true).catch(err => console.error('Final save failed:', err));
       }
       this.isRunning = false;
       updateAutoTrainerUI();
@@ -1266,16 +1276,16 @@ const autoTrainer = {
       
       this.currentStep += 1;
       
-      // 저장 실행
+      // 저장 실행 (비블로킹: await 하지 않음)
       if (this.currentStep - this.lastSaveStep >= opts.saveInterval) {
-        await saveTrainingCheckpoint(false);
+        saveTrainingCheckpoint(false).catch(err => console.error('Auto-save failed:', err));
         this.lastSaveStep = this.currentStep;
       }
       
       // 정기적 체크포인트 (배터리 절약, 모바일 백그라운드 대비)
       const elapsedTime = Date.now() - this.sessionStartTime;
       if (elapsedTime > opts.checkpointInterval) {
-        await saveTrainingCheckpoint(true);
+        saveTrainingCheckpoint(true).catch(err => console.error('Checkpoint save failed:', err));
         this.sessionStartTime = Date.now();
       }
       
@@ -1289,13 +1299,8 @@ const autoTrainer = {
       return;
     }
     
-    // 다음 단계 예약 (requestIdleCallback 우선, 폴백 setTimeout)
-    const opts2 = this.getOptimizations();
-    if (typeof requestIdleCallback === "function" && !opts2.isMobile) {
-      this.trainingTimeoutId = requestIdleCallback(() => this.runNextStep(), { timeout: 1000 });
-    } else {
-      this.trainingTimeoutId = setTimeout(() => this.runNextStep(), opts2.delayBetweenSteps);
-    }
+    // 다음 단계 예약 (즉시 실행 - setTimeout(0) 사용)
+    this.trainingTimeoutId = setTimeout(() => this.runNextStep(), opts.delayBetweenSteps);
   },
   
   pause() {
@@ -1556,61 +1561,75 @@ document.addEventListener('visibilitychange', async () => {
   const isNowVisible = pageVisibility === 'visible';
   
   if (wasVisible && !isNowVisible) {
-    // 백그라운드로 전환: 훈련 일시정지 + 체크포인트 저장
+    // 백그라운드로 전환: 훈련 일시정지 + 즉시 저장
     if (autoTrainer.isRunning && !autoTrainer.isPaused) {
-      console.log('[Auto-Trainer] 페이지가 백그라운드로 전환됨. 훈련 일시정지 및 체크포인트 저장.');
+      console.log('[Auto-Trainer] 페이지가 백그라운드로 전환됨. 훈련 일시정지 및 즉시 저장.');
       autoTrainer.pause();
+      // 즉시 저장 (매우 중요)
       await saveTrainingCheckpoint(true);
+      showToast("⏸️ 백그라운드 전환: 훈련 일시정지 · 진행상황 저장됨");
     }
   } else if (!wasVisible && isNowVisible) {
-    // 포그라운드로 복귀: 훈련 재개 가능 (사용자 확인 후)
+    // 포그라운드로 복귀
     if (autoTrainer.isPaused) {
-      console.log('[Auto-Trainer] 페이지가 포그라운드로 복귀. 훈련 일시정지 상태 유지.');
-      showToast("훈련이 일시정지되어 있습니다. 재개 버튼을 눌러 계속하세요.");
+      console.log('[Auto-Trainer] 페이지가 포그라운드로 복귀.');
+      showToast("✅ 포그라운드 복귀 · 재개 버튼으로 계속하세요");
     }
   }
 });
 
-// 페이지 언로드 시 훈련 중지 + 최종 저장
-window.addEventListener('beforeunload', async (event) => {
+// 페이지 언로드 시 훈련 중지 + 최종 저장 (베스트 에포트)
+window.addEventListener('beforeunload', (event) => {
   if (autoTrainer.isRunning) {
-    // 훈련 중지
     autoTrainer.stop();
-    // 최종 체크포인트 저장 시도 (비동기이지만 기다리지 않음)
-    saveTrainingCheckpoint(true).catch(err => console.error('Final checkpoint save failed:', err));
+    // 비동기이지만 베스트 에포트로 시도
+    navigator.sendBeacon?.('/', new Blob([JSON.stringify({action: 'save-checkpoint'})], {type: 'application/json'}));
   }
 });
-
-// ===== 메모리 경고 대응 (Apple Safari, Chrome Android) =====
-if ('memory' in performance) {
-  // 메모리 모니터링 (Chrome 개발자 도구)
-  setInterval(() => {
-    const memUsage = performance.memory;
-    if (memUsage && memUsage.usedJSHeapSize / memUsage.jsHeapSizeLimit > 0.85) {
-      console.warn('[Auto-Trainer] 메모리 사용률이 높습니다:', 
-        Math.round((memUsage.usedJSHeapSize / memUsage.jsHeapSizeLimit) * 100) + '%');
-      
-      // 훈련 중이고 메모리가 부족하면 일시정지 + 저장
-      if (autoTrainer.isRunning && !autoTrainer.isPaused) {
-        console.warn('[Auto-Trainer] 메모리 부족으로 일시정지합니다.');
-        autoTrainer.pause();
-        saveTrainingCheckpoint(true);
-        showToast("메모리 부족으로 훈련이 일시정지되었습니다. 재개하거나 저장하세요.");
-      }
-    }
-  }, 5000);
-}
 
 // ===== 온라인/오프라인 대응 =====
 window.addEventListener('offline', () => {
   console.log('[Auto-Trainer] 오프라인 전환');
-  if (autoTrainer.isRunning) {
+  if (autoTrainer.isRunning && !autoTrainer.isPaused) {
     autoTrainer.pause();
-    showToast("⚠️ 오프라인 상태. 훈련이 일시정지되었습니다.");
+    showToast("⚠️ 오프라인: 훈련 일시정지 (WiFi 재연결 후 재개 가능)");
   }
 });
 
 window.addEventListener('online', () => {
   console.log('[Auto-Trainer] 온라인 복귀');
-  showToast("✅ 온라인 복귀. 훈련을 재개할 수 있습니다.");
+  showToast("✅ 온라인 복귀 · 훈련을 재개할 수 있습니다");
 });
+
+// ===== 배터리 절약 모드 감지 =====
+if ('getBattery' in navigator) {
+  navigator.getBattery?.().then(battery => {
+    const updateBatteryStatus = () => {
+      if (battery.level < 0.1 && autoTrainer.isRunning) {
+        autoTrainer.pause();
+        showToast("🔋 배터리 부족 (10% 이하): 훈련 일시정지");
+      }
+    };
+    battery.addEventListener('levelchange', updateBatteryStatus);
+  }).catch(() => {});
+}
+
+// ===== 메모리 경고 모니터링 (선택적) =====
+if ('memory' in performance) {
+  let lastWarning = 0;
+  setInterval(() => {
+    const memUsage = performance.memory;
+    if (memUsage && memUsage.usedJSHeapSize / memUsage.jsHeapSizeLimit > 0.9) {
+      const now = Date.now();
+      if (now - lastWarning > 5000) {
+        console.warn('[Auto-Trainer] 메모리 사용률 > 90%');
+        lastWarning = now;
+        if (autoTrainer.isRunning && !autoTrainer.isPaused) {
+          autoTrainer.pause();
+          showToast("⚠️ 메모리 부족: 훈련 일시정지 · 저장 중...");
+          saveTrainingCheckpoint(true).catch(err => console.error('Memory crisis save failed:', err));
+        }
+      }
+    }
+  }, 2000);
+}
