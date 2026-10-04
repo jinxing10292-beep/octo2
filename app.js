@@ -1166,3 +1166,293 @@ checkBrowserReadiness();
 renderVocabulary();
 makeMessage("assistant", "안녕하세요! 자동 모드에서는 저장된 자료에 직접적인 근거가 있을 때 출처와 함께 답하고, 그 외의 일상 대화는 로컬 미니 모델로 생성해요. 모델이 작아 답변이 부정확할 수 있습니다.", [], "system");
 transformerReady = initializeSavedTransformer();
+
+
+// ===== 자동 훈련 시스템 =====
+
+const BACKEND_URL = "http://localhost:5000";
+const autoTrainer = {
+  isRunning: false,
+  isPaused: false,
+  totalSteps: 0,
+  currentStep: 0,
+  losses: [],
+  
+  async start() {
+    if (!transformerModel) {
+      showToast("먼저 모델을 초기화하거나 훈련하세요.");
+      return;
+    }
+    
+    this.isRunning = true;
+    this.isPaused = false;
+    this.totalSteps = parseInt(document.querySelector("#auto-training-steps").value) || 100;
+    this.currentStep = 0;
+    this.losses = [];
+    
+    updateAutoTrainerUI();
+    showToast("자동 훈련 시작...");
+    
+    while (this.isRunning && this.currentStep < this.totalSteps) {
+      if (this.isPaused) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        continue;
+      }
+      
+      try {
+        // 백엔드에서 문장 받아오기
+        const response = await fetch(`${BACKEND_URL}/api/sentence`);
+        if (!response.ok) throw new Error("백엔드 연결 실패");
+        
+        const data = await response.json();
+        const sentence = data.sentence;
+        
+        // 훈련
+        const loss = window.OCTO_MINI_GPT.trainStep(transformerModel, sentence, 512);
+        this.losses.push(loss);
+        this.currentStep += 1;
+        
+        // 25단계마다 자동 저장
+        if (this.currentStep % 25 === 0) {
+          await saveTrainingCheckpoint(false);
+        }
+        
+        // UI 업데이트
+        updateAutoTrainerUI();
+        
+        // 부하 조절 (약간의 지연)
+        await new Promise(resolve => setTimeout(resolve, 10));
+        
+      } catch (error) {
+        console.error("훈련 오류:", error);
+        showToast(`훈련 오류: ${error.message}`);
+        this.stop();
+      }
+    }
+    
+    if (this.currentStep >= this.totalSteps) {
+      showToast("자동 훈련 완료!");
+      await saveTrainingCheckpoint(true);
+    }
+    
+    updateAutoTrainerUI();
+  },
+  
+  pause() {
+    this.isPaused = !this.isPaused;
+    updateAutoTrainerUI();
+    showToast(this.isPaused ? "훈련 일시정지" : "훈련 재개");
+  },
+  
+  stop() {
+    this.isRunning = false;
+    this.isPaused = false;
+    updateAutoTrainerUI();
+    showToast("자동 훈련 중지됨");
+  },
+  
+  async downloadJSON() {
+    if (!transformerModel) {
+      showToast("모델이 없습니다.");
+      return;
+    }
+    
+    try {
+      const packageData = await makeWeightsPackage();
+      const json = JSON.stringify(packageData, null, 2);
+      
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `octo-weights-${new Date().toISOString().slice(0, 10)}.json`;
+      link.click();
+      URL.revokeObjectURL(url);
+      
+      showToast("가중치 JSON을 다운로드했습니다.");
+    } catch (error) {
+      showToast(`다운로드 오류: ${error.message}`);
+    }
+  },
+  
+  async copyJSON() {
+    if (!transformerModel) {
+      showToast("모델이 없습니다.");
+      return;
+    }
+    
+    try {
+      const packageData = await makeWeightsPackage();
+      const json = JSON.stringify(packageData, null, 2);
+      
+      await navigator.clipboard.writeText(json);
+      showToast("가중치 JSON을 클립보드에 복사했습니다.");
+    } catch (error) {
+      showToast(`복사 오류: ${error.message}`);
+    }
+  }
+};
+
+function updateAutoTrainerUI() {
+  const startBtn = document.querySelector("#auto-training-start");
+  const pauseBtn = document.querySelector("#auto-training-pause");
+  const stopBtn = document.querySelector("#auto-training-stop");
+  const downloadBtn = document.querySelector("#auto-training-download");
+  const copyBtn = document.querySelector("#auto-training-copy");
+  const progressDiv = document.querySelector("#auto-training-progress");
+  const statusDiv = document.querySelector("#auto-training-status");
+  
+  if (!startBtn) return; // UI 요소가 없으면 리턴
+  
+  // 버튼 상태
+  startBtn.disabled = autoTrainer.isRunning;
+  pauseBtn.disabled = !autoTrainer.isRunning;
+  stopBtn.disabled = !autoTrainer.isRunning;
+  
+  // 진행률 표시
+  const progress = autoTrainer.totalSteps > 0 
+    ? Math.round((autoTrainer.currentStep / autoTrainer.totalSteps) * 100) 
+    : 0;
+  
+  progressDiv.style.width = progress + "%";
+  progressDiv.textContent = progress + "%";
+  
+  // 상태 텍스트
+  if (autoTrainer.isRunning) {
+    const avgLoss = autoTrainer.losses.length > 0
+      ? (autoTrainer.losses.reduce((a, b) => a + b) / autoTrainer.losses.length).toFixed(4)
+      : "계산 중...";
+    
+    const lastLoss = autoTrainer.losses.length > 0
+      ? autoTrainer.losses[autoTrainer.losses.length - 1].toFixed(4)
+      : "계산 중...";
+    
+    statusDiv.innerHTML = `
+      <div style="font-size: 13px; color: #666;">
+        <div>단계: ${autoTrainer.currentStep}/${autoTrainer.totalSteps}</div>
+        <div>평균 손실: ${avgLoss}</div>
+        <div>최근 손실: ${lastLoss}</div>
+        <div>${autoTrainer.isPaused ? "⏸️ 일시정지 중" : "▶️ 훈련 중"}</div>
+      </div>
+    `;
+  } else {
+    statusDiv.innerHTML = `
+      <div style="font-size: 13px; color: #666;">
+        <div>최종 단계: ${autoTrainer.currentStep}/${autoTrainer.totalSteps}</div>
+        <div>${autoTrainer.losses.length > 0 
+          ? `평균 손실: ${(autoTrainer.losses.reduce((a, b) => a + b) / autoTrainer.losses.length).toFixed(4)}`
+          : "준비됨"}</div>
+      </div>
+    `;
+  }
+}
+
+// 자동 훈련 UI 초기화
+function initAutoTrainerUI() {
+  const trainingPanel = document.querySelector(".transformer-panel");
+  if (!trainingPanel) return;
+  
+  // 자동 훈련 섹션 HTML
+  const autoTrainerHTML = `
+    <div style="margin-top: 30px; padding: 15px; border-top: 2px solid #eee;">
+      <h3 style="margin: 0 0 15px 0; font-size: 16px; color: #333;">🤖 자동 훈련 (실험)</h3>
+      
+      <div style="display: grid; gap: 10px;">
+        <div>
+          <label for="auto-training-steps" style="font-size: 13px; color: #666;">훈련 단계:</label>
+          <input 
+            type="number" 
+            id="auto-training-steps" 
+            value="100" 
+            min="1" 
+            max="10000"
+            style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box;"
+          >
+        </div>
+        
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+          <button 
+            id="auto-training-start" 
+            type="button"
+            onclick="autoTrainer.start()"
+            style="padding: 10px; background: #28a745; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;"
+          >▶️ 시작</button>
+          <button 
+            id="auto-training-pause" 
+            type="button"
+            onclick="autoTrainer.pause()"
+            disabled
+            style="padding: 10px; background: #ffc107; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; opacity: 0.5;"
+          >⏸️ 일시정지</button>
+        </div>
+        
+        <button 
+          id="auto-training-stop" 
+          type="button"
+          onclick="autoTrainer.stop()"
+          disabled
+          style="padding: 10px; background: #dc3545; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; opacity: 0.5;"
+        >⏹️ 중지</button>
+        
+        <div id="auto-training-progress-container" style="background: #f0f0f0; border-radius: 4px; overflow: hidden; height: 24px; position: relative;">
+          <div 
+            id="auto-training-progress"
+            style="height: 100%; background: linear-gradient(90deg, #007bff, #0056b3); width: 0%; display: flex; align-items: center; justify-content: center; color: white; font-size: 12px; font-weight: bold; transition: width 0.3s ease;"
+          >0%</div>
+        </div>
+        
+        <div id="auto-training-status" style="font-size: 13px; color: #666; line-height: 1.5;">
+          준비됨
+        </div>
+        
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+          <button 
+            id="auto-training-download"
+            type="button"
+            onclick="autoTrainer.downloadJSON()"
+            style="padding: 10px; background: #17a2b8; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;"
+          >📥 JSON 다운로드</button>
+          <button 
+            id="auto-training-copy"
+            type="button"
+            onclick="autoTrainer.copyJSON()"
+            style="padding: 10px; background: #6c757d; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;"
+          >📋 JSON 복사</button>
+        </div>
+      </div>
+      
+      <p style="font-size: 12px; color: #999; margin: 15px 0 0 0;">
+        💡 백엔드 연결 상태: <span id="backend-status">확인 중...</span>
+      </p>
+    </div>
+  `;
+  
+  // HTML 추가
+  trainingPanel.insertAdjacentHTML('beforeend', autoTrainerHTML);
+  
+  // 백엔드 상태 확인
+  checkBackendStatus();
+}
+
+async function checkBackendStatus() {
+  try {
+    const response = await fetch(`${BACKEND_URL}/api/health`);
+    const statusSpan = document.querySelector("#backend-status");
+    if (statusSpan) {
+      statusSpan.textContent = response.ok ? "✅ 연결됨" : "❌ 오류";
+      statusSpan.style.color = response.ok ? "#28a745" : "#dc3545";
+    }
+  } catch (error) {
+    const statusSpan = document.querySelector("#backend-status");
+    if (statusSpan) {
+      statusSpan.textContent = "❌ 연결 실패 (백엔드 시작 필요)";
+      statusSpan.style.color = "#dc3545";
+    }
+  }
+}
+
+// 페이지 로드 시 자동 훈련 UI 초기화
+window.addEventListener('load', () => {
+  setTimeout(initAutoTrainerUI, 500);
+  setInterval(checkBackendStatus, 30000); // 30초마다 상태 확인
+});
